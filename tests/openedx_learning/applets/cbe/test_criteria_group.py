@@ -75,7 +75,8 @@ def test_group_logic_operator_accepts_and_or_and_null_regardless_of_child_count(
     childless = CompetencyCriteriaGroup.objects.create(tag=tag, logic_operator=logic_operator)
     assert childless.pk is not None
 
-    parent = CompetencyCriteriaGroup.objects.create(tag=tag, logic_operator=logic_operator)
+    # Nested under `childless` rather than a second root: a tag may have at most one root group.
+    parent = CompetencyCriteriaGroup.objects.create(tag=tag, parent=childless, logic_operator=logic_operator)
     CompetencyCriteriaGroup.objects.create(tag=tag, parent=parent)
     CompetencyCriteriaGroup.objects.create(tag=tag, parent=parent)
     assert CompetencyCriteriaGroup.objects.filter(parent=parent).count() == 2

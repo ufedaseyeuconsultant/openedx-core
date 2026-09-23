@@ -1,9 +1,7 @@
 """
 Delete-behavior tests for CompetencyCriteriaGroup, CompetencyRuleProfile, and CompetencyCriterion.
 
-See ADR-0002 Decision 7 for why each foreign key here is CASCADE or PROTECT, including the two
-that assert a different value than issue #641 itself specifies, and see the "residual tension"
-section below for the one case where a PROTECT raises naming the wrong object.
+See ADR-0002 Decision 7 for why each foreign key here is CASCADE, PROTECT, or RESTRICT.
 
 Fixtures shared with test_criteria_models.py and test_criteria_trees.py live in this directory's
 conftest.py.
@@ -11,7 +9,7 @@ conftest.py.
 import pytest
 from django.apps import apps
 from django.db import connection
-from django.db.models import ProtectedError
+from django.db.models import ProtectedError, RestrictedError
 from organizations.models import Organization
 
 from openedx_catalog.models import CourseRun
@@ -191,63 +189,50 @@ def test_deleting_an_object_tag_also_deletes_its_criteria(
     assert not CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
 
 
-def test_deleting_a_rule_profile_referenced_by_a_criterion_raises_protected_error(
+def test_deleting_a_rule_profile_referenced_by_a_criterion_raises_restricted_error(
     group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile
 ) -> None:
     """
     Deleting a CompetencyRuleProfile that a CompetencyCriterion references via `rule_profile`
-    raises ProtectedError.
+    raises RestrictedError: `rule_profile` is RESTRICT, not PROTECT (see ADR-0002 Decision 7),
+    since only RESTRICT lets a scope owner's own deletion carry the profile away in the same
+    operation, but a standalone profile delete like this one still refuses.
     """
     criterion = CompetencyCriterion.objects.create(
         group=group, object_tag=object_tag, rule_profile=default_rule_profile
     )
 
-    with pytest.raises(ProtectedError) as exc_info:
+    with pytest.raises(RestrictedError) as exc_info:
         default_rule_profile.delete()
 
-    protected = exc_info.value.protected_objects
-    assert any(isinstance(obj, CompetencyCriterion) and obj.pk == criterion.pk for obj in protected)
+    restricted = exc_info.value.restricted_objects
+    assert any(isinstance(obj, CompetencyCriterion) and obj.pk == criterion.pk for obj in restricted)
 
 
-# ==============================================================================================
-# Residual tension: see ADR-0002 Decision 7's "Known limitation" bullet for why deleting a
-# taxonomy whose scoped profile is assigned to a criterion raises ProtectedError naming that
-# criterion, even though the criterion would also be cascade-deleted in the same operation.
-# ==============================================================================================
-
-
-def test_taxonomy_delete_blocked_by_its_scoped_profile_names_the_criterion_not_the_profile(
+def test_taxonomy_delete_cascades_cleanly_through_its_scoped_profile_and_criterion(
     competency_taxonomy: CompetencyTaxonomy, group: CompetencyCriteriaGroup, object_tag: ObjectTag
 ) -> None:
     """
     Deleting a CompetencyTaxonomy whose taxonomy-scoped profile is itself assigned to a criterion
-    raises ProtectedError naming the CRITERION, not the profile actually being cascaded away.
+    succeeds, cascading through the profile and the criterion in the same operation.
 
-    The taxonomy delete cascades into the profile (`competency_taxonomy` is CASCADE), and only then
-    discovers the profile is referenced by the criterion via `rule_profile` (PROTECT). Django's
-    PROTECT handler raises unconditionally whenever a referencing row exists in the database; it
-    never checks whether that same row is also already part of the same delete's pending set, so it
-    fires here even though this exact criterion would also be reached and removed via the tag chain
-    (Tag -> CompetencyCriteriaGroup.tag -> CompetencyCriterion.group, all CASCADE) if the profile
-    hadn't blocked the walk first. This is a spurious, confusing failure -- an author deleting a
-    taxonomy is told a criterion is in the way, when nothing about that criterion actually survives
-    the delete either -- but it is not reachable in this MVP (see the section header above), so
-    this pins the current behavior rather than working around it with a schema change.
+    The taxonomy delete cascades into the profile (`competency_taxonomy` is CASCADE) and, via the
+    tag chain (Tag -> CompetencyCriteriaGroup.tag -> CompetencyCriterion.group, all CASCADE), into
+    the criterion that references that same profile through `rule_profile`. `rule_profile` is
+    RESTRICT, not PROTECT (see ADR-0002 Decision 7), precisely so this case works: RESTRICT only
+    refuses when the referencing row is NOT already part of the same delete's pending set, unlike
+    PROTECT, which would have raised here unconditionally even though the criterion is also being
+    removed in the same operation.
     """
     profile = CompetencyRuleProfile.objects.create(
         competency_taxonomy=competency_taxonomy, rule_type=RuleType.GRADE, rule_payload=_GRADE_PAYLOAD
     )
     criterion = CompetencyCriterion.objects.create(group=group, object_tag=object_tag, rule_profile=profile)
 
-    with pytest.raises(ProtectedError) as exc_info:
-        competency_taxonomy.delete()
+    competency_taxonomy.delete()
 
-    protected = exc_info.value.protected_objects
-    assert any(isinstance(obj, CompetencyCriterion) and obj.pk == criterion.pk for obj in protected)
-    assert not any(isinstance(obj, CompetencyRuleProfile) and obj.pk == profile.pk for obj in protected)
-    # Nothing was actually removed: the whole operation raised before any DELETE executed.
-    assert CompetencyRuleProfile.objects.filter(pk=profile.pk).exists()
-    assert CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
+    assert not CompetencyRuleProfile.objects.filter(pk=profile.pk).exists()
+    assert not CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
 
 
 # ==============================================================================================

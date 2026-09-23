@@ -12,8 +12,7 @@ from django.db.utils import IntegrityError
 from organizations.models import Organization
 
 from openedx_catalog.models import CatalogCourse, CourseRun
-# Private: the payload-spec registry, compared against RuleType's declared choices below.
-from openedx_learning.applets.cbe.rule_payloads import _RULE_PAYLOAD_SPECS
+from openedx_learning.applets.cbe.rule_payloads import validate_rule_payload
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -469,18 +468,24 @@ def test_criterion_full_clean_rejects_invalid_override_payload(
 def test_rule_type_choices_match_rule_types_with_a_defined_payload_spec() -> None:
     """
     RuleType's declared choices (what a serializer or an admin form offers an author) must contain
-    exactly the rule types that can actually be saved. ADR-0002 Decision 3 defines a rule_payload
-    shape per rule_type, and a rule_type with no defined shape is always rejected by
-    validate_rule_payload's "not supported yet" branch, regardless of payload content. RuleType
-    therefore declares only the rule types with a payload-spec entry (currently just Grade); a
-    future rule type not yet built (a "View" or "MasteryLevel") is neither a RuleType member nor a
-    declared choice until both its spec class and its RuleType member land together. This pins
-    that invariant so declaring a new RuleType member and forgetting its payload spec (or vice
-    versa) fails a test instead of shipping a dead-end choice.
+    exactly the rule types validate_rule_payload actually matches on. validate_rule_payload's
+    `match` statement rejects any rule_type falling through to its `case _` with a "not supported
+    yet" error, regardless of payload content, so every declared RuleType member must hit one of
+    the earlier, specific cases instead. This pins that invariant so declaring a new RuleType
+    member and forgetting its `case` in validate_rule_payload (or vice versa) fails a test instead
+    of shipping a dead-end choice.
     """
-    declared_rule_types = {choice_value for choice_value, _label in RuleType.choices}
-    enforced_rule_types = set(_RULE_PAYLOAD_SPECS.keys())
-    assert declared_rule_types == enforced_rule_types
+    not_supported_message = "is not supported yet"
+    for rule_type in RuleType:
+        with pytest.raises(ValidationError) as exc_info:
+            # An empty payload is malformed for every currently-defined rule type, so this isolates
+            # "fell through to the not-supported case" from "matched a case, then payload rejected".
+            validate_rule_payload(rule_type, payload={})
+        assert not_supported_message not in str(exc_info.value)
+
+    with pytest.raises(ValidationError) as exc_info:
+        validate_rule_payload("NotARealRuleType", payload={})
+    assert not_supported_message in str(exc_info.value)
 
 
 def test_criterion_rule_profile_is_not_recomputed_once_a_more_specific_profile_appears(
