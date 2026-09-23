@@ -5,7 +5,7 @@ Models for Competency-Based Education (CBE).
 from ..rule_payloads import RuleType
 from .competency_taxonomy import CompetencyTaxonomy
 from .criteria import CompetencyCriteriaGroup, CompetencyCriterion, CompetencyRuleProfile, LogicOperator
-from .learner_status import CompetencyMasteryStatus, MasteryStatus
+from .learner_status import CompetencyMasteryStatus, MasteryStatus, StudentCompetencyStatus
 
 __all__ = [
     "CompetencyCriteriaGroup",
@@ -16,4 +16,5 @@ __all__ = [
     "LogicOperator",
     "MasteryStatus",
     "RuleType",
+    "StudentCompetencyStatus",
 ]
