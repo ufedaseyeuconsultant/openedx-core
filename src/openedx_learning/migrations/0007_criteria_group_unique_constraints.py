@@ -13,7 +13,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('openedx_learning', '0003_seed_default_rule_profile'),
+        ('openedx_learning', '0006_competencycriterion'),
     ]
 
     operations = [

@@ -13,7 +13,7 @@ class Migration(migrations.Migration):
     dependencies = [
         ('openedx_catalog', '0001_initial'),
         ('openedx_learning', '0003_competencycriteriagroup'),
-        ('organizations', '0005_competencyruleprofile'),
+        ('organizations', '0004_auto_20230727_2054'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
