@@ -53,13 +53,13 @@ _INVALID_GRADE_PAYLOADS = [
 
 def test_group_has_exactly_the_columns_adr_0002_decision_2_lists() -> None:
     """
-    CompetencyCriteriaGroup's columns are exactly the ones ADR-0002 Decision 2 lists, with
-    `parent`, `course`, and `logic_operator` optional and the rest required. `tag` keeps the
-    legacy `oel_tagging_tag_id` column name. No `archived` column yet; that arrives with #642.
+    CompetencyCriteriaGroup's columns are exactly the ones ADR-0002 Decision 2 lists, plus the
+    `archived` column #681 added, with `parent`, `course`, and `logic_operator` optional and the
+    rest required. `tag` keeps the legacy `oel_tagging_tag_id` column name.
     """
     fields = [f for f in CompetencyCriteriaGroup._meta.get_fields() if f.concrete]
     assert {f.name for f in fields} == {
-        "id", "uuid", "parent", "tag", "course", "name", "ordering", "logic_operator",
+        "id", "uuid", "parent", "tag", "course", "name", "ordering", "logic_operator", "archived",
     }
     assert {f.name for f in fields if f.null} == {"parent", "course", "logic_operator"}
     assert CompetencyCriteriaGroup._meta.get_field("parent").remote_field.model is CompetencyCriteriaGroup
@@ -89,14 +89,15 @@ def test_rule_profile_has_exactly_the_columns_adr_0002_decision_3_lists() -> Non
 
 def test_criterion_has_exactly_the_columns_adr_0002_decision_4_lists() -> None:
     """
-    CompetencyCriterion's columns are exactly the ones ADR-0002 Decision 4 lists, with
-    `rule_profile`, `rule_type_override`, and `rule_payload_override` optional and the rest
-    required. No `archived` column yet; that arrives with #642. Carries no Meta.db_table
-    override, so the table is Django's default name for the class.
+    CompetencyCriterion's columns are exactly the ones ADR-0002 Decision 4 lists, plus the
+    `archived`, with `rule_profile`, `rule_type_override`, and
+    `rule_payload_override` optional and the rest required. Carries no Meta.db_table override,
+    so the table is Django's default name for the class.
     """
     fields = [f for f in CompetencyCriterion._meta.get_fields() if f.concrete]
     assert {f.name for f in fields} == {
         "id", "uuid", "group", "object_tag", "rule_profile", "rule_type_override", "rule_payload_override",
+        "archived",
     }
     assert {f.name for f in fields if f.null} == {"rule_profile", "rule_type_override", "rule_payload_override"}
     assert CompetencyCriterion._meta.get_field("group").db_column == "competency_criteria_group_id"

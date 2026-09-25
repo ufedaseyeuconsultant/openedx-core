@@ -96,6 +96,10 @@ class CompetencyCriteriaGroup(models.Model):
             "logic is moot; the application layer treats null the same as OR."
         ),
     )
+    archived = models.BooleanField(
+        default=False,
+        help_text=_("Hides this row from the criteria-tree read endpoint by default, without removing it."),
+    )
 
     history = HistoricalRecords()
 
@@ -334,6 +338,10 @@ class CompetencyCriterion(models.Model):
     )
     rule_type_override = models.CharField(max_length=32, choices=RuleType, null=True, blank=True)
     rule_payload_override = models.JSONField(null=True, blank=True)
+    archived = models.BooleanField(
+        default=False,
+        help_text=_("Hides this row from the criteria-tree read endpoint by default, without removing it."),
+    )
 
     history = HistoricalRecords()
 
