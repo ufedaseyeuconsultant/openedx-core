@@ -7,14 +7,14 @@ from dataclasses import dataclass
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import QuerySet
+from django.db.models import Q, QuerySet
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from opaque_keys import InvalidKeyError
-from opaque_keys.edx.keys import UsageKey
+from opaque_keys.edx.keys import CourseKey, UsageKey
 
-from openedx_catalog.api import get_course_run
+from openedx_catalog.api import get_course_run, get_course_run_ids
 from openedx_catalog.models import CourseRun
 from openedx_tagging.api import get_object_tags, tag_object
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
@@ -27,6 +27,7 @@ __all__ = [
     "get_competency_criteria_tree",
     "get_competency_rule_profiles",
     "is_competency_taxonomy",
+    "parse_course_keys",
     "resolve_competency_tag",
     "create_leaf_group",
     "resolve_supplied_leaf_group",
@@ -93,19 +94,112 @@ class CompetencyCriteriaTree:
 
     groups: list[CompetencyCriteriaGroup]
     criteria: list[CompetencyCriterion]
+    criteria_count: int
+    total_criteria_count: int
 
 
-def get_competency_criteria_tree(tag_id: int) -> CompetencyCriteriaTree:
+def get_competency_criteria_tree(
+    tag_id: int, course_keys: list[CourseKey] | None = None,
+) -> CompetencyCriteriaTree:
     """
-    Return every non-archived CompetencyCriteriaGroup and CompetencyCriterion for competency `tag_id`.
+    Return every non-archived CompetencyCriteriaGroup and CompetencyCriterion for competency
+    `tag_id`.
+
+    `course_keys=None` (the default) returns everything, unfiltered. `course_keys=[]` returns
+    only the instance-wide subtree (the root). A non-empty list adds the complete subtree for
+    each named course run, in the order given; an unresolvable or duplicate key is dropped or
+    collapsed to its first occurrence, never an error.
+
+    `criteria_count` is `len(criteria)`. `total_criteria_count` is the same count unfiltered
+    by `course_keys`, so a caller scoped down to zero results can still tell the competency
+    isn't actually empty.
     """
-    groups = list(
-        CompetencyCriteriaGroup.objects.filter(tag_id=tag_id, archived=False).select_related("course")
-    )
+    groups_qs = CompetencyCriteriaGroup.objects.filter(tag_id=tag_id, archived=False)
+
+    course_run_ids_by_key: dict[CourseKey, int] = {}
+    if course_keys is not None:
+        course_run_ids_by_key = get_course_run_ids(course_keys)
+        course_run_ids = set(course_run_ids_by_key.values())
+        groups_qs = groups_qs.filter(
+            Q(parent__isnull=True) | Q(course_id__in=course_run_ids) | Q(parent__course_id__in=course_run_ids)
+        )
+
+    groups = list(groups_qs.select_related("course"))
     criteria = list(
         CompetencyCriterion.objects.filter(group__in=groups, archived=False).select_related("object_tag")
     )
-    return CompetencyCriteriaTree(groups=groups, criteria=criteria)
+
+    if course_keys is not None:
+        groups_by_id = {group.id: group for group in groups}
+        # A leaf's parent is usually already in `groups` (it matches course_id__in on its own
+        # row), but not if the parent is archived -- the join above checks the leaf's archived
+        # flag, not the parent's. Look such parents up directly instead of ranking their
+        # children as unscoped.
+        parent_ids_of_courseless_groups = (group.parent_id for group in groups if group.course_id is None)
+        missing_parent_ids: set[int] = {
+            parent_id for parent_id in parent_ids_of_courseless_groups
+            if parent_id is not None and parent_id not in groups_by_id
+        }
+        parent_course_id_by_id = dict(
+            CompetencyCriteriaGroup.objects.filter(id__in=missing_parent_ids).values_list("id", "course_id")
+        ) if missing_parent_ids else {}
+
+        rank_by_course_run_id = {
+            run_id: index
+            for index, run_id in enumerate(
+                course_run_ids_by_key[key] for key in course_keys if key in course_run_ids_by_key
+            )
+        }
+
+        def _group_rank(group: CompetencyCriteriaGroup) -> int:
+            effective_course_id = group.course_id
+            if effective_course_id is None and group.parent_id is not None:
+                parent = groups_by_id.get(group.parent_id)
+                if parent is not None:
+                    effective_course_id = parent.course_id
+                else:
+                    effective_course_id = parent_course_id_by_id.get(group.parent_id)
+            return rank_by_course_run_id.get(effective_course_id, -1)
+
+        groups.sort(key=lambda g: (_group_rank(g), g.id))
+        criteria.sort(key=lambda c: (_group_rank(groups_by_id[c.group_id]), c.id))
+
+    total_criteria_count = CompetencyCriterion.objects.filter(
+        group__tag_id=tag_id, group__archived=False, archived=False,
+    ).count()
+
+    return CompetencyCriteriaTree(
+        groups=groups, criteria=criteria,
+        criteria_count=len(criteria), total_criteria_count=total_criteria_count,
+    )
+
+
+MAX_COURSE_KEYS = 100
+
+
+def parse_course_keys(raw: str) -> list[CourseKey]:
+    """
+    Parse a comma-separated course_keys query parameter into a deduplicated list of CourseKey.
+
+    Stray separators (trailing, doubled, or all-commas) are ignored, not rejected. Raises
+    ValidationError if more than MAX_COURSE_KEYS entries remain after splitting -- checked
+    before dedup, so repeating a key can't dodge the cap -- or if any entry isn't a valid key.
+    """
+    entries = [entry.strip() for entry in raw.split(",")]
+    entries = [entry for entry in entries if entry]
+    if len(entries) > MAX_COURSE_KEYS:
+        raise ValidationError(
+            {"course_keys": _("No more than %(max)s course_keys may be requested at once.") % {"max": MAX_COURSE_KEYS}}
+        )
+    parsed = []
+    for entry in entries:
+        try:
+            parsed.append(CourseKey.from_string(entry))
+        except InvalidKeyError as exc:
+            raise ValidationError(
+                {"course_keys": _("'%(entry)s' is not a valid course key.") % {"entry": entry}}
+            ) from exc
+    return list(dict.fromkeys(parsed))
 
 
 def create_leaf_group(
