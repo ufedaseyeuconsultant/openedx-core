@@ -791,3 +791,146 @@ def test_no_view_access_to_the_taxonomy_is_403(api_client: APIClient, user: User
     response = api_client.get(criteria_tree_url(tag.id))
 
     assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+# course_keys scoping
+
+
+def test_course_keys_scopes_and_orders_the_response_over_a_real_request(
+    user_client: APIClient,
+    tag: Tag,
+    course_run: CourseRun,
+    organization: Organization,
+    default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    A real GET request scoped to two of three course runs returns only those two courses'
+    groups and criteria, in the order requested, with nothing from the third course run --
+    proving the scoping and ordering behavior end to end (view, permission, serializers), not
+    just at the get_competency_criteria_tree() function level.
+    """
+    course_b = make_course_run(organization, "Python200", "Fall2026")
+    course_c = make_course_run(organization, "Python300", "Fall2026")
+    leaf_a = create_leaf_group(tag, course_run)
+    leaf_b = create_leaf_group(tag, course_b)
+    leaf_c = create_leaf_group(tag, course_c)
+    for leaf, run, name in [(leaf_a, course_run, "a"), (leaf_b, course_b, "b"), (leaf_c, course_c, "c")]:
+        object_tag = ObjectTag.objects.create(object_id=usage_key(run, name), taxonomy=tag.taxonomy, tag=tag)
+        CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
+    assert course_run.course_key is not None
+    assert course_b.course_key is not None
+    b_group_ids = {leaf_b.id, leaf_b.parent_id}
+    a_group_ids = {leaf_a.id, leaf_a.parent_id}
+    c_group_ids = {leaf_c.id, leaf_c.parent_id}
+
+    response = user_client.get(
+        criteria_tree_url(tag.id), {"course_keys": f"{course_b.course_key},{course_run.course_key}"},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    returned_group_ids = {group["id"] for group in response.data["groups"]}
+    assert not returned_group_ids & c_group_ids
+    b_positions = [i for i, g in enumerate(response.data["groups"]) if g["id"] in b_group_ids]
+    a_positions = [i for i, g in enumerate(response.data["groups"]) if g["id"] in a_group_ids]
+    assert max(b_positions) < min(a_positions)
+    assert response.data["criteria_count"] == 2
+    assert response.data["total_criteria_count"] == 3
+
+
+def test_course_keys_with_a_trailing_comma_matches_the_clean_list(
+    user_client: APIClient, tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A trailing comma in course_keys is ignored: the response is identical to the clean list."""
+    leaf = create_leaf_group(tag, course_run)
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+    CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
+    assert course_run.course_key is not None
+    key = str(course_run.course_key)
+
+    clean = user_client.get(criteria_tree_url(tag.id), {"course_keys": key})
+    trailing_comma = user_client.get(criteria_tree_url(tag.id), {"course_keys": f"{key},"})
+
+    assert clean.status_code == trailing_comma.status_code == status.HTTP_200_OK
+    assert trailing_comma.data == clean.data
+
+
+def test_course_keys_with_a_doubled_comma_matches_the_clean_list(
+    user_client: APIClient, tag: Tag, course_run: CourseRun, organization: Organization,
+) -> None:
+    """A doubled comma between two course_keys is ignored: the response is identical to the clean list."""
+    other_course_run = make_course_run(organization, "Python200", "Fall2026")
+    create_leaf_group(tag, course_run)
+    create_leaf_group(tag, other_course_run)
+    assert course_run.course_key is not None
+    assert other_course_run.course_key is not None
+    key_a = str(course_run.course_key)
+    key_b = str(other_course_run.course_key)
+
+    clean = user_client.get(criteria_tree_url(tag.id), {"course_keys": f"{key_a},{key_b}"})
+    doubled_comma = user_client.get(criteria_tree_url(tag.id), {"course_keys": f"{key_a},,{key_b}"})
+
+    assert clean.status_code == doubled_comma.status_code == status.HTTP_200_OK
+    assert doubled_comma.data == clean.data
+
+
+def test_course_keys_of_only_commas_behaves_like_an_empty_scope(
+    user_client: APIClient, tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A course_keys value of only commas behaves like an omitted/empty scope: only the root group."""
+    leaf = create_leaf_group(tag, course_run)
+    course_level = leaf.parent
+    assert course_level is not None
+    root = course_level.parent
+    assert root is not None
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+    CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
+
+    response = user_client.get(criteria_tree_url(tag.id), {"course_keys": ",,,"})
+
+    assert response.status_code == status.HTTP_200_OK
+    assert {group["id"] for group in response.data["groups"]} == {root.id}
+    assert response.data["criteria"] == []
+    assert response.data["criteria_count"] == 0
+    assert response.data["total_criteria_count"] == 1
+
+
+def test_a_malformed_course_key_is_400(user_client: APIClient, tag: Tag) -> None:
+    """An entry in course_keys that isn't a valid course key 400s."""
+    response = user_client.get(criteria_tree_url(tag.id), {"course_keys": "not-a-course-key"})
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_more_than_the_limit_of_course_keys_is_400(user_client: APIClient, tag: Tag) -> None:
+    """More than 100 course_keys entries 400s, and the error names the 100 limit."""
+    too_many = ",".join(f"course-v1:Org+Course{i}+Run" for i in range(101))
+
+    response = user_client.get(criteria_tree_url(tag.id), {"course_keys": too_many})
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "100" in str(response.data)
+
+
+def test_no_view_access_with_course_keys_still_403s_without_leaking_data(
+    api_client: APIClient, user: UserType, tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    A 403 for missing view access discloses neither array nor either count, even with garbage
+    in course_keys: permission is checked before course_keys is parsed.
+    """
+    leaf = create_leaf_group(tag, course_run)
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+    CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
+    taxonomy = tag.taxonomy
+    assert taxonomy is not None
+    taxonomy.enabled = False
+    taxonomy.save()
+    api_client.force_authenticate(user=user)
+
+    response = api_client.get(criteria_tree_url(tag.id), {"course_keys": "not-a-course-key"})
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert "groups" not in response.data
+    assert "criteria" not in response.data
+    assert "criteria_count" not in response.data
+    assert "total_criteria_count" not in response.data
