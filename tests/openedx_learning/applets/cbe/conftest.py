@@ -1,4 +1,6 @@
 """Shared fixtures for the CBE test modules: schema, deletion, tree-integration, and REST tests."""
+from datetime import datetime, timezone
+
 import pytest
 from django.contrib.auth.models import User as UserType  # pylint: disable=imported-auth-user
 from organizations.api import ensure_organization
@@ -93,3 +95,9 @@ def _staff_client(staff_user: UserType) -> APIClient:
     client = APIClient()
     client.force_authenticate(user=staff_user)
     return client
+
+
+@pytest.fixture(name="now")
+def _now() -> datetime:
+    """A single UTC timestamp shared by writes in a test."""
+    return datetime.now(timezone.utc)

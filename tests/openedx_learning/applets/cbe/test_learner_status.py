@@ -10,7 +10,6 @@ walking a `Tag` delete away for free, and `StudentCompetencyStatus.status`
 from datetime import datetime, timezone
 
 import pytest
-from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
@@ -21,39 +20,10 @@ from openedx_tagging.models import Tag
 pytestmark = pytest.mark.django_db
 
 
-@pytest.fixture(name="competency_taxonomy")
-def _competency_taxonomy() -> CompetencyTaxonomy:
-    """A CompetencyTaxonomy for use as a scope, and as the home taxonomy for `tag`."""
-    return CompetencyTaxonomy.objects.create(name="Nursing", export_id="nursing-v1")
-
-
-@pytest.fixture(name="tag")
-def _tag(competency_taxonomy: CompetencyTaxonomy) -> Tag:
-    """A Tag, from `competency_taxonomy`, for use as the competency a learner is assessed on."""
-    return Tag.objects.create(taxonomy=competency_taxonomy, value="Writing Poetry")
-
-
 @pytest.fixture(name="other_tag")
 def _other_tag(competency_taxonomy: CompetencyTaxonomy) -> Tag:
     """A second Tag, from the same taxonomy as `tag`, for a second competency-level status."""
     return Tag.objects.create(taxonomy=competency_taxonomy, value="Decimals")
-
-
-@pytest.fixture(name="user")
-def _user():
-    """
-    Create a single learner for use in these tests.
-
-    Deliberately unannotated: the user model is swappable, so this library must not
-    name a concrete one (edx-lint enforces that as `imported-auth-user`).
-    """
-    return get_user_model().objects.create(username="learner")
-
-
-@pytest.fixture(name="now")
-def _now() -> datetime:
-    """A single UTC timestamp shared by writes in a test."""
-    return datetime.now(timezone.utc)
 
 
 # ==============================================================================================
