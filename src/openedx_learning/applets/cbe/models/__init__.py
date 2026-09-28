@@ -8,6 +8,7 @@ from .criteria import CompetencyCriteriaGroup, CompetencyCriterion, CompetencyRu
 from .learner_status import (
     CompetencyMasteryStatus,
     MasteryStatus,
+    StudentCompetencyCriteriaGroupStatus,
     StudentCompetencyCriteriaStatus,
     StudentCompetencyStatus,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "LogicOperator",
     "MasteryStatus",
     "RuleType",
+    "StudentCompetencyCriteriaGroupStatus",
     "StudentCompetencyCriteriaStatus",
     "StudentCompetencyStatus",
 ]
