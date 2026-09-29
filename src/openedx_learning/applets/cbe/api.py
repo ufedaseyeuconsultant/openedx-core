@@ -50,6 +50,7 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+MAX_COURSE_KEYS = 100
 
 
 def create_competency_taxonomy(  # pylint: disable=too-many-positional-arguments
@@ -220,9 +221,6 @@ def get_competency_criteria_tree(
         groups=groups, criteria=criteria,
         criteria_count=len(criteria), total_criteria_count=total_criteria_count,
     )
-
-
-MAX_COURSE_KEYS = 100
 
 
 def parse_course_keys(raw: str) -> list[CourseKey]:
