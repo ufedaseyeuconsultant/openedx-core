@@ -340,6 +340,42 @@ def test_tag_delete_protected_by_competency_status_on_tag(tag: Tag, user, now: d
     assert Tag.objects.filter(pk=tag.pk).exists()
 
 
+def test_parent_tag_delete_protected_by_competency_status_on_child_tag(
+    competency_taxonomy: CompetencyTaxonomy, tag: Tag, user, now: datetime,
+) -> None:
+    """
+    Deleting a parent Tag raises ProtectedError when a StudentCompetencyStatus row references
+    one of its child tags, reached transitively: parent Tag -> child Tag via Tag.parent
+    (CASCADE, in openedx_tagging) -> the status row via StudentCompetencyStatus.tag (PROTECT).
+    """
+    child_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Sonnets", parent=tag)
+    StudentCompetencyStatus.objects.create(
+        user=user, tag=child_tag, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    with pytest.raises(ProtectedError), transaction.atomic():
+        tag.delete()
+
+    assert Tag.objects.filter(pk=tag.pk).exists()
+    assert Tag.objects.filter(pk=child_tag.pk).exists()
+
+
+def test_unreferenced_tag_delete_succeeds(tag: Tag, other_tag: Tag, user, now: datetime) -> None:
+    """
+    Deleting a Tag that no StudentCompetencyStatus row references succeeds, and leaves a status
+    row on a different tag untouched: PROTECT blocks only the tags a status row references.
+    """
+    scs = StudentCompetencyStatus.objects.create(
+        user=user, tag=other_tag, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    tag.delete()
+
+    assert not Tag.objects.filter(pk=tag.pk).exists()
+    assert Tag.objects.filter(pk=other_tag.pk).exists()
+    assert StudentCompetencyStatus.objects.filter(pk=scs.pk).exists()
+
+
 def test_taxonomy_delete_protected_by_competency_status_beneath_a_tag(
     competency_taxonomy: CompetencyTaxonomy, tag: Tag, user, now: datetime,
 ) -> None:
