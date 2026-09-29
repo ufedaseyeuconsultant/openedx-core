@@ -30,15 +30,15 @@ def test_anonymous_may_not_view_rule_profiles() -> None:
     assert can_view_competency_rule_profile(AnonymousUser()) is False
 
 
-def test_profile_argument_does_not_change_the_answer(
+def test_staff_may_view_a_specific_profile_and_non_staff_may_not(
     staff_user: UserType,
     user: UserType,
     default_rule_profile: CompetencyRuleProfile,
 ) -> None:
     """
-    Passing a specific profile gives the same answer as asking about the collection.
-
-    The argument exists for the scoped profiles that come later; nothing may depend on it yet.
+    A staff user may view a specific rule profile, and a non-staff user may not, matching each
+    one's permission on the collection. The profile argument is accepted for the scoped profiles
+    still to come; nothing depends on it yet.
     """
     assert can_view_competency_rule_profile(staff_user, default_rule_profile) is True
     assert can_view_competency_rule_profile(user, default_rule_profile) is False

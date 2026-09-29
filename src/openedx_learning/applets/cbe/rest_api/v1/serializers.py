@@ -15,14 +15,17 @@ class CompetencyRuleProfileSerializer(serializers.ModelSerializer):
     UNSTABLE: the rule profile family is incomplete, so the create, update, and archive
     endpoints still to come may change this shape without a deprecation cycle.
 
-    ``rule_payload`` is emitted verbatim as stored: :ref:`openedx-learning-adr-0002` Decision 3
-    owns the payload contract, and normalizing it here would make this a second, competing
-    definition of it. That is also why the payload's own ``scale`` key matters, since it is what
-    stops a caller reading the threshold fraction as a percentage or the reverse.
+    ``rule_payload`` is emitted verbatim as stored. For ``Grade``, the only rule type
+    supported in this phase, that shape is ``{"op": ..., "value": ..., "scale": ...}``:
+    ``op`` is one of ``gte``, ``lte``, or ``eq``, and ``value`` is a fraction between 0.0
+    and 1.0 inclusive. ``GradePayload`` and ``validate_rule_payload`` in the
+    ``rule_payloads`` module own that shape, so it is not renormalized here. ``scale``
+    confirms the fraction is a percentage, ruling out any other scale.
 
-    ``scope_code`` and the raw ``organization``, ``course``, and ``competency_taxonomy`` columns
-    are internal bookkeeping that ADR-0002 Decision 3 keeps out of anything exported; the
-    ``scope_type`` below is what a client reads instead.
+    ``scope_code`` and the raw ``organization``, ``course``, and ``competency_taxonomy``
+    columns are left out: ``scope_type`` below is what a client can act on, while the
+    others are internal, existing only to enforce the one-profile-per-scope constraint
+    (:ref:`openedx-learning-adr-0002` Decision 3).
     """
 
     scope_type = serializers.SerializerMethodField()

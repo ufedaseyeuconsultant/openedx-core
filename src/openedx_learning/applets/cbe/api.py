@@ -56,6 +56,21 @@ def get_competency_rule_profiles() -> QuerySet[CompetencyRuleProfile]:
     return CompetencyRuleProfile.objects.filter(archived=False).order_by("id")
 
 
+def get_competency_rule_profiles() -> QuerySet[CompetencyRuleProfile]:
+    """
+    Return every live CompetencyRuleProfile, in ascending ``id`` order.
+
+    UNSTABLE: the rule profile family is incomplete, so the create, update, and archive entry
+    points still to come may change this function's shape without a deprecation cycle.
+
+    Archived profiles are left out: retirement is archive-only.
+
+    The ordering is part of the contract rather than a cosmetic detail: an unordered queryset
+    gives a paginating caller overlapping and skipped pages.
+    """
+    return CompetencyRuleProfile.objects.filter(archived=False).order_by("id")
+
+
 def is_competency_taxonomy(taxonomy: Taxonomy) -> bool:
     """
     Return True if ``taxonomy`` is competency-enabled, i.e. has a CompetencyTaxonomy row.
