@@ -53,8 +53,8 @@ def test_group_status_has_no_history_package_applied() -> None:
     No history package is applied.
     """
     assert not hasattr(StudentCompetencyCriteriaGroupStatus, "history")
-    with pytest.raises(LookupError):
-        apps.get_model("openedx_learning", "HistoricalStudentCompetencyCriteriaGroupStatus")
+    registered = {model.__name__ for model in apps.get_app_config("openedx_learning").get_models()}
+    assert "HistoricalStudentCompetencyCriteriaGroupStatus" not in registered
 
 
 @pytest.mark.parametrize("status", list(MasteryStatus), ids=[status.label for status in MasteryStatus])
