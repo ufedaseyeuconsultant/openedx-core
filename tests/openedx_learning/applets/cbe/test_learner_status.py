@@ -176,11 +176,14 @@ def test_attempted_not_demonstrated_rejected_on_queryset_update(user, tag: Tag, 
 @pytest.mark.parametrize("status_id", [-1, 4, 30000])
 def test_status_outside_the_allow_list_rejected(user, tag: Tag, now: datetime, status_id: int) -> None:
     """
-    A status id that is not in the allow-list is rejected, including ids no
-    CompetencyMasteryStatus row exists for. The constraint is an allow-list rather than a
-    negation of AttemptedNotDemonstrated, so a value nobody has defined yet is refused by
-    default instead of silently accepted.
+    A status id that is not in the allow-list is rejected. The constraint is an allow-list
+    rather than a negation of AttemptedNotDemonstrated, so a value nobody has defined yet is
+    refused by default instead of silently accepted. A lookup row is created for the id first,
+    so the foreign key is satisfied and only the allow-list constraint can reject the write,
+    on every database backend.
     """
+    CompetencyMasteryStatus.objects.create(id=status_id, status=f"Undefined{status_id}")
+
     with pytest.raises(IntegrityError), transaction.atomic():
         StudentCompetencyStatus.objects.create(
             user=user, tag=tag, status_id=status_id, created=now, modified=now,
