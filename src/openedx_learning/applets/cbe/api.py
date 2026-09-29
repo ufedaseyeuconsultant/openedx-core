@@ -34,6 +34,8 @@ __all__ = [
     "select_competency_taxonomies",
 ]
 
+MAX_COURSE_KEYS = 100
+
 
 def get_competency_rule_profiles() -> QuerySet[CompetencyRuleProfile]:
     """
@@ -172,9 +174,6 @@ def get_competency_criteria_tree(
         groups=groups, criteria=criteria,
         criteria_count=len(criteria), total_criteria_count=total_criteria_count,
     )
-
-
-MAX_COURSE_KEYS = 100
 
 
 def parse_course_keys(raw: str) -> list[CourseKey]:
