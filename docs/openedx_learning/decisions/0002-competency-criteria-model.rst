@@ -109,7 +109,7 @@ Decision
 
    - Empty groups: Persisted criteria definitions should not contain empty groups. Authoring flows may temporarily create empty groups while editing, but backend validation must reject them.
    - Mixed tree depths: Backend supports deeply nested groups. Current frontend authoring constraint is a maximum depth of 3 layers total, using zero-indexed depth (``0=root``, ``1=course-scope group``, ``2=leaf criteria/group``).
-   - Retrieval scope: A read always includes the root scope (all nodes where ``course_id is null``), plus any selected subset of course-scoped groups, each returned as a complete subtree, never truncated.
+   - Retrieval scope: A read always includes the root scope (all nodes where ``course_id is null``), plus any selected subset of course-scoped groups, each returned as a complete subtree, never truncated. As implemented (\#682), the course-scoped predicate only walks a group's own ``course_id`` and its immediate parent's, matching the three-level tree ``create_leaf_group()`` is the only path that currently produces (root, course-scope group, leaf); nothing today creates a group nested under a leaf. A future authoring path that creates such a group would need this predicate extended to walk the full ancestor chain, to keep this "never truncated" guarantee for a deeper tree.
    - Practical size and growth: Total rows in ``CompetencyCriteriaGroup`` are expected to grow over time as course runs are added; this ADR sets no global DB row cap. No max total node-count cap is required per root group. For ``course_id is null`` branches, expected size is small (realistically <=500 nodes).
 
 
@@ -458,3 +458,11 @@ Changelog
 * ``scope_code`` on ``CompetencyRuleProfile`` is now computed by
   application code instead of being database-generated, and is set to null while a
   profile is archived, freeing its scope for a replacement.
+
+2026-09-30:
+
+* For issue #682: noted that the course-scoped retrieval predicate, as implemented, only
+  walks two levels of ancestry (a group's own ``course_id`` and its immediate parent's),
+  matching the three-level tree ``create_leaf_group()`` is the only path that currently
+  produces. Flagged that a future authoring path nesting a group under a leaf would need
+  this predicate extended to walk the full ancestor chain.
