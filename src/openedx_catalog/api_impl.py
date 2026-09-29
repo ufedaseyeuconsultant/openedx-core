@@ -3,6 +3,7 @@ Implementation of the `openedx_catalog` API.
 """
 
 import logging
+from collections.abc import Iterable
 from typing import overload
 
 from opaque_keys.edx.keys import CourseKey
@@ -19,6 +20,7 @@ __all__ = [
     "update_catalog_course",
     "delete_catalog_course",
     "get_course_run",
+    "get_course_run_ids",
     "sync_course_run_details",
     "create_course_run_for_modulestore_course_with",
     "delete_course_run",
@@ -114,6 +116,23 @@ def get_course_run(course_key: CourseKey) -> CourseRun:
     `get_catalog_course(...).runs`
     """
     return CourseRun.objects.get(course_key__exact=course_key)
+
+
+def get_course_run_ids(course_keys: Iterable[CourseKey]) -> dict[CourseKey, int]:
+    """
+    Return a {course_key: CourseRun.id} mapping for the entries that resolve to a real
+    CourseRun. An unmatched key is simply absent from the result.
+    """
+    course_keys = list(course_keys)
+    if not course_keys:
+        return {}
+    # course_key's accessor is typed CourseKey | None regardless of null=False (opaque_keys'
+    # own stub), so filter here instead of asserting past mypy.
+    return {
+        key: run_id
+        for key, run_id in CourseRun.objects.filter(course_key__in=course_keys).values_list("course_key", "id")
+        if key is not None
+    }
 
 
 def sync_course_run_details(
