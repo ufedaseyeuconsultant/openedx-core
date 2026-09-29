@@ -75,7 +75,7 @@ class StudentCompetencyStatus(models.Model):
         constraints = [
             # ADR-0002 Decision 5 index 8. This is what makes "one row per learner and
             # competency" true, which is the precondition for updating a status in place
-            # with a conditional UPDATE: it is load-bearing, not a lookup optimisation.
+            # with a conditional UPDATE: it is load-bearing, not a lookup optimization.
             models.UniqueConstraint(
                 fields=("user", "tag"),
                 name="oex_learning_studentcompetencystatus_user_tag_uniq",
