@@ -1,4 +1,4 @@
-"""Tests pinning #613's whole-feature acceptance criteria across the models #641 and #642 add."""
+"""Tests pinning #613's whole-feature acceptance criteria across the models #640, #641 and #642 add."""
 import inspect
 from io import StringIO
 from pathlib import Path
@@ -16,6 +16,7 @@ from openedx_learning.applets.cbe.models import criteria, learner_status
 pytestmark = pytest.mark.django_db
 
 MODELS_613_ADDS = [
+    "CompetencyTaxonomy",
     "CompetencyCriteriaGroup",
     "CompetencyRuleProfile",
     "CompetencyCriterion",
