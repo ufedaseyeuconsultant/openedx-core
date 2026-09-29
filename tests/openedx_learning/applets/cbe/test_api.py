@@ -14,6 +14,7 @@ from openedx_learning.api import (
     create_leaf_group,
     get_competency_criteria_tree,
     get_competency_rule_profiles,
+    get_courses_with_relative_criteria,
     is_competency_taxonomy,
     resolve_supplied_leaf_group,
     select_competency_taxonomies,
@@ -45,6 +46,22 @@ def usage_key(course_run: CourseRun, block_id: str) -> str:
     key = course_run.course_key
     assert key is not None
     return f"block-v1:{key.org}+{key.course}+{key.run}+type@sequential+block@{block_id}"
+
+
+def make_tag(taxonomy: CompetencyTaxonomy, value: str, parent: Tag | None = None) -> Tag:
+    """Create a Tag on `taxonomy`, optionally under `parent`, for taxonomy-hierarchy tests."""
+    return Tag.objects.create(taxonomy=taxonomy, value=value, parent=parent)
+
+
+def make_criterion(
+    tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile, block_id: str,
+) -> CompetencyCriterion:
+    """
+    Create a leaf group and one live CompetencyCriterion for `tag` in `course_run`.
+    """
+    leaf = create_leaf_group(tag, course_run)
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, block_id), taxonomy=tag.taxonomy, tag=tag)
+    return CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
 
 
 def test_is_competency_taxonomy() -> None:
@@ -885,3 +902,111 @@ def test_get_competency_criteria_tree_a_different_tag_never_leaks_into_this_ones
     assert [c.id for c in tree.criteria] == [criterion.id]
     assert tree.criteria_count == 1
     assert tree.total_criteria_count == 1
+
+
+def test_get_courses_with_relative_criteria_single_match(
+    competency_taxonomy: CompetencyTaxonomy, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A single tag with a live criterion in a course is returned, mapped to that tag."""
+    relative = make_tag(competency_taxonomy, "Relative Skill")
+    make_criterion(relative, course_run, default_rule_profile, "p1")
+
+    assert get_courses_with_relative_criteria([relative.id]) == {course_run: relative}
+
+
+def test_get_courses_with_relative_criteria_ties_break_on_the_lowest_tag_id(
+    competency_taxonomy: CompetencyTaxonomy, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """When two of the given tags both have a live criterion in the same course, the lower id tag wins."""
+    first = make_tag(competency_taxonomy, "First Relative")
+    second = make_tag(competency_taxonomy, "Second Relative")
+    assert first.id < second.id
+    make_criterion(first, course_run, default_rule_profile, "p1")
+    make_criterion(second, course_run, default_rule_profile, "p2")
+
+    result = get_courses_with_relative_criteria([second.id, first.id])
+
+    assert result == {course_run: first}
+
+
+def test_get_courses_with_relative_criteria_empty_input_yields_an_empty_result() -> None:
+    """An empty tag_ids collection yields an empty result, not an error."""
+    assert not get_courses_with_relative_criteria([])
+
+
+def test_get_courses_with_relative_criteria_excludes_a_group_with_no_live_criterion(
+    competency_taxonomy: CompetencyTaxonomy, course_run: CourseRun,
+) -> None:
+    """A CompetencyCriteriaGroup for a relative tag with no attached criterion is not a conflict."""
+    relative = make_tag(competency_taxonomy, "Empty Relative")
+    create_leaf_group(relative, course_run)
+
+    assert not get_courses_with_relative_criteria([relative.id])
+
+
+def test_validate_containment_rejects_an_ancestor_conflict(
+    competency_taxonomy: CompetencyTaxonomy, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A live criterion on an ancestor of group.tag, in the same course, is rejected."""
+    parent = make_tag(competency_taxonomy, "Ancestor Skill")
+    child = make_tag(competency_taxonomy, "Descendant Skill", parent=parent)
+    make_criterion(parent, course_run, default_rule_profile, "p1")
+    group = create_leaf_group(child, course_run)
+
+    with pytest.raises(ValidationError, match="tag_id"):
+        cbe_api._validate_containment(group, course_run)  # pylint: disable=protected-access
+
+
+def test_validate_containment_rejects_a_descendant_conflict(
+    competency_taxonomy: CompetencyTaxonomy, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A live criterion on a descendant of group.tag, in the same course, is rejected."""
+    parent = make_tag(competency_taxonomy, "Ancestor Skill 2")
+    child = make_tag(competency_taxonomy, "Descendant Skill 2", parent=parent)
+    make_criterion(child, course_run, default_rule_profile, "p1")
+    group = create_leaf_group(parent, course_run)
+
+    with pytest.raises(ValidationError, match="tag_id"):
+        cbe_api._validate_containment(group, course_run)  # pylint: disable=protected-access
+
+
+def test_validate_containment_allows_sibling_tags(
+    competency_taxonomy: CompetencyTaxonomy, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """Two tags sharing a parent, neither one the other's ancestor, do not conflict."""
+    parent = make_tag(competency_taxonomy, "Shared Parent")
+    sibling_a = make_tag(competency_taxonomy, "Sibling A", parent=parent)
+    sibling_b = make_tag(competency_taxonomy, "Sibling B", parent=parent)
+    make_criterion(sibling_a, course_run, default_rule_profile, "p1")
+    group = create_leaf_group(sibling_b, course_run)
+
+    cbe_api._validate_containment(group, course_run)  # pylint: disable=protected-access  # Must not raise.
+
+
+def test_validate_containment_allows_the_same_tag_in_a_different_course(
+    tag: Tag, course_run: CourseRun, organization: Organization, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A live criterion for the same tag, scoped to a different course, does not block this course."""
+    other_course_run = make_course_run(organization, "Python200", "Fall2026")
+    make_criterion(tag, other_course_run, default_rule_profile, "p1")
+    group = create_leaf_group(tag, course_run)
+
+    cbe_api._validate_containment(group, course_run)  # pylint: disable=protected-access  # Must not raise.
+
+
+def test_validate_containment_allows_a_tag_with_no_relatives(tag: Tag, course_run: CourseRun) -> None:
+    """A tag with neither ancestors nor descendants has nothing to conflict with."""
+    group = create_leaf_group(tag, course_run)
+
+    cbe_api._validate_containment(group, course_run)  # pylint: disable=protected-access  # Must not raise.
+
+
+def test_create_competency_criterion_rejects_a_group_object_id_course_mismatch(
+    tag: Tag, course_run: CourseRun, organization: Organization,
+) -> None:
+    """object_id's own course must match group's course, even when nothing else conflicts."""
+    other_course_run = make_course_run(organization, "Python200", "Fall2026")
+    group = create_leaf_group(tag, course_run)
+
+    with pytest.raises(ValidationError, match="object_id"):
+        cbe_api.create_competency_criterion(group, usage_key(other_course_run, "p1"))
