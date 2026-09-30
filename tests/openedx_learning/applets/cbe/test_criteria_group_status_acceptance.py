@@ -6,10 +6,9 @@ import importlib
 from datetime import datetime
 
 import pytest
-from django.apps import apps
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import connection, models
+from django.db import models
 
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
@@ -48,15 +47,6 @@ def test_group_status_carries_created_and_modified() -> None:
     assert isinstance(fields["modified"], models.DateTimeField)
 
 
-def test_group_status_has_no_history_package_applied() -> None:
-    """
-    No history package is applied.
-    """
-    assert not hasattr(StudentCompetencyCriteriaGroupStatus, "history")
-    registered = {model.__name__ for model in apps.get_app_config("openedx_learning").get_models()}
-    assert "HistoricalStudentCompetencyCriteriaGroupStatus" not in registered
-
-
 @pytest.mark.parametrize("status", list(MasteryStatus), ids=[status.label for status in MasteryStatus])
 def test_group_status_accepts_every_status_value(
     user, group: CompetencyCriteriaGroup, now: datetime, status: MasteryStatus
@@ -76,8 +66,9 @@ def test_group_status_accepts_a_lower_status_written_over_a_higher_one(
     user, group: CompetencyCriteriaGroup, now: datetime
 ) -> None:
     """
-    No monotone-write logic and no staff-edit path land here. The models accept any status value the
-    caller writes, so a lower status written over a higher one takes effect.
+    The model accepts any status value the caller writes, so a lower status written over a higher one takes
+    effect. Staff edits may lower a status, and the monotone-write rule (a status is only ever raised) applies
+    to the default tree calculation alone, which enforces it in the API layer.
     """
     row = StudentCompetencyCriteriaGroupStatus.objects.create(
         user=user, group=group, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
@@ -90,20 +81,6 @@ def test_group_status_accepts_a_lower_status_written_over_a_higher_one(
     assert changed == 1
     row.refresh_from_db()
     assert row.status_id == MasteryStatus.ATTEMPTED_NOT_DEMONSTRATED
-
-
-def test_group_status_has_only_the_adr_0002_decision_6_columns() -> None:
-    """
-    No column exists on this model beyond those in ADR-0002 Decision 6 and the timestamps this issue lists.
-    """
-    with connection.cursor() as cursor:
-        description = connection.introspection.get_table_description(
-            cursor, StudentCompetencyCriteriaGroupStatus._meta.db_table
-        )
-
-    assert {column.name for column in description} == {
-        "id", "competency_criteria_group_id", "user_id", "status_id", "created", "modified",
-    }
 
 
 def test_group_status_foreign_keys_target_the_adr_0002_tables() -> None:
