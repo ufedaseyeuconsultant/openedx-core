@@ -189,10 +189,13 @@ def test_tagging_api_parent_tag_delete_is_protected_by_a_criterion_status_under_
         user=user, criterion=subtag_criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
     )
 
+    count_before = Tag.objects.filter(pk__in=[tag.pk, subtag.pk]).count()
+
     with pytest.raises(ProtectedError), transaction.atomic():
         tagging_api.delete_tags_from_taxonomy(competency_taxonomy, [tag.value], with_subtags=True)
 
-    assert Tag.objects.filter(pk__in=[tag.pk, subtag.pk]).count() == 2
+    assert count_before == 2
+    assert Tag.objects.filter(pk__in=[tag.pk, subtag.pk]).count() == count_before
 
 
 def test_taxonomy_delete_is_protected_by_a_criterion_status(
