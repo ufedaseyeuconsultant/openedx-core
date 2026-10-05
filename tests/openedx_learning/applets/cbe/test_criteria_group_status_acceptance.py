@@ -108,7 +108,7 @@ def test_group_status_migration_declares_the_swappable_user_dependency() -> None
     declared in the migration, so that deployments with a swapped user model still work.
     """
     dependencies = importlib.import_module(
-        "openedx_learning.migrations.0012_studentcompetencycriteriagroupstatus"
+        "openedx_learning.migrations.0014_studentcompetencycriteriagroupstatus"
     ).Migration.dependencies
 
     assert any(getattr(dependency, "setting", None) == settings.AUTH_USER_MODEL for dependency in dependencies)

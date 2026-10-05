@@ -28,7 +28,7 @@ def revert(apps, schema_editor):  # pragma: no cover
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("openedx_learning", "0008_competency_mastery_status"),
+        ("openedx_learning", "0010_competency_mastery_status"),
     ]
 
     operations = [

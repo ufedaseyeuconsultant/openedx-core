@@ -4,7 +4,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('openedx_learning', '0007_alter_criterion_override_help_text'),
+        ('openedx_learning', '0009_competencycriteriagroup_archived_and_more'),
     ]
 
     operations = [

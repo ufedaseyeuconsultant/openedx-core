@@ -10,7 +10,7 @@ import openedx_django_lib.validators
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('openedx_learning', '0010_studentcompetencystatus'),
+        ('openedx_learning', '0012_studentcompetencystatus'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

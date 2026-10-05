@@ -9,7 +9,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('oel_tagging', '0021_remove_system_defined_add_read_only'),
-        ('openedx_learning', '0009_seed_competency_mastery_statuses'),
+        ('openedx_learning', '0011_seed_competency_mastery_statuses'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
