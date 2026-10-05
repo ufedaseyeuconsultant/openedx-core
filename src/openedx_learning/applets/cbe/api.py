@@ -13,6 +13,7 @@ from django.core.exceptions import NON_FIELD_ERRORS, PermissionDenied, Validatio
 from django.db import connection, transaction
 from django.db.models import F, Q, QuerySet
 from django.db.transaction import TransactionManagementError
+from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from opaque_keys import InvalidKeyError
 from opaque_keys.edx.keys import UsageKey
@@ -37,6 +38,7 @@ from .models import (
 from .rule_payloads import evaluate_rule
 
 __all__ = [
+    "CompetencyCriteriaGroupArchivedError",
     "CompetencyCriteriaTree",
     "CompetencyCriterionArchivedError",
     "GradedObjectScore",
@@ -52,6 +54,7 @@ __all__ = [
     "resolve_competency_tag",
     "resolve_supplied_leaf_group",
     "select_competency_taxonomies",
+    "update_competency_criteria_group",
 ]
 
 log = logging.getLogger(__name__)
@@ -91,6 +94,12 @@ def create_competency_taxonomy(  # pylint: disable=too-many-positional-arguments
     )
     assert isinstance(taxonomy, CompetencyTaxonomy)
     return taxonomy
+
+
+class CompetencyCriteriaGroupArchivedError(Exception):
+    """
+    Raised when a request would edit a CompetencyCriteriaGroup that has been archived.
+    """
 
 
 def get_competency_rule_profiles() -> QuerySet[CompetencyRuleProfile]:
@@ -781,3 +790,75 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
         changed += _raise_leaf_status(user_id, criterion.pk, status, now)
 
     return changed
+
+
+def update_competency_criteria_group(
+    group_id: int,
+    *,
+    logic_operator: str,
+    user: UserType,
+) -> CompetencyCriteriaGroup:
+    """
+    Set how the CompetencyCriteriaGroup ``group_id`` names combines its children, and return it.
+
+    ``logic_operator`` is the only thing this changes. The group's name, ordering, competency,
+    course, and parent stay as they were created, and so does everything beneath it. A request
+    that leaves ``logic_operator`` as stored saves nothing, so the group's history gains a row
+    only for a real change. Learner status is never read or written.
+
+    Raises Http404 if no group has ``group_id``, or Tag.DoesNotExist if its tag isn't on a
+    CompetencyTaxonomy.
+    Raises ValidationError, keyed by the REST field names, for a root group, a group with no course
+    anywhere above it to check permission against, or a ``logic_operator`` other than AND or OR, and
+    PermissionDenied if ``user`` fails ``oel_tagging.can_tag_object`` for the group's taxonomy and
+    course. Raises CompetencyCriteriaGroupArchivedError if the group is archived, even when nothing
+    would change.
+    """
+    with transaction.atomic():
+        group = get_object_or_404(
+            CompetencyCriteriaGroup.objects.select_related("course", "parent__course"), pk=group_id,
+        )
+        # Nothing in the model stops a group's tag being on another kind of taxonomy, so it's checked
+        # the way the create and tree endpoints check theirs.
+        tag = resolve_competency_tag(group.tag_id)
+        # tag.taxonomy is already confirmed set; re-asserted since that doesn't cross function boundaries for mypy.
+        assert tag.taxonomy is not None
+        # A root has neither a parent nor a course, and its subtree can span several courses, so
+        # there's no one course to check permission against.
+        if group.parent_id is None and group.course_id is None:
+            raise ValidationError({"group_id": _("A root CompetencyCriteriaGroup cannot be targeted directly.")})
+        # A course-level group carries its own course, and a group beneath one takes the course of
+        # its nearest ancestor that has one, however deeply it's nested.
+        course_run = None
+        ancestor: CompetencyCriteriaGroup | None = group
+        while course_run is None and ancestor is not None:
+            course_run = ancestor.course
+            ancestor = ancestor.parent
+        if course_run is None:
+            raise ValidationError(
+                {"group_id": _("This CompetencyCriteriaGroup has no course above it to check permission against.")}
+            )
+        perm_obj = ObjectTagPermissionItem(taxonomy=tag.taxonomy, object_id=str(course_run.course_key))
+        # has_perm()'s stub expects a Model, but a rules predicate takes any object.
+        if not user.has_perm("oel_tagging.can_tag_object", perm_obj):  # type: ignore[arg-type]
+            raise PermissionDenied
+
+        # Null is a stored state (a single-child group), but never one a caller may ask for.
+        if logic_operator not in LogicOperator.values:
+            raise ValidationError(
+                {"logic_operator": _("logic_operator must be one of: {choices}.").format(
+                    choices=", ".join(LogicOperator.values),
+                )}
+            )
+        # ADR-0002 Decision 2 hides archived groups from authoring; nothing reopens one here.
+        if group.archived:
+            raise CompetencyCriteriaGroupArchivedError(_("An archived CompetencyCriteriaGroup cannot be edited."))
+        if group.logic_operator == logic_operator:
+            return group
+
+        group.logic_operator = logic_operator
+        # Set on the instance so attribution doesn't depend on simple_history's request middleware.
+        group._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
+        # Never QuerySet.update(): it skips post_save, so simple_history would record nothing.
+        group.save(update_fields=["logic_operator"])
+        return group

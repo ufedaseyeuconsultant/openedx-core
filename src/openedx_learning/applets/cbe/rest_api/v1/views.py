@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import QuerySet
+from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthentication  # type: ignore[import]
 from edx_rest_framework_extensions.auth.session.authentication import (  # type: ignore[import]
@@ -21,18 +22,21 @@ from openedx_tagging.models import Tag
 from openedx_tagging.rules import ObjectTagPermissionItem
 
 from ...api import (
+    CompetencyCriteriaGroupArchivedError,
     CompetencyCriterionArchivedError,
     associate_competency_criterion,
     bulk_update_competency_criteria,
     get_competency_criteria_tree,
     get_competency_rule_profiles,
     resolve_competency_tag,
+    update_competency_criteria_group,
 )
 from ...models import CompetencyCriteriaGroup, CompetencyCriterion, CompetencyRuleProfile
 from ..paginators import CompetencyRuleProfilePagination
 from .permissions import CompetencyReadPermission, CompetencyRuleProfilePermissions
 from .serializers import (
     CompetencyCriteriaGroupSerializer,
+    CompetencyCriteriaGroupUpdateSerializer,
     CompetencyCriterionBulkUpdateSerializer,
     CompetencyCriterionReadSerializer,
     CompetencyCriterionSerializer,
@@ -198,3 +202,49 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
             "groups": CompetencyCriteriaGroupSerializer(tree.groups, many=True).data,
             "criteria": CompetencyCriterionReadSerializer(tree.criteria, many=True).data,
         })
+
+
+class CompetencyCriteriaGroupDetailView(generics.GenericAPIView):
+    """
+    PATCH-only. Change how one CompetencyCriteriaGroup combines the criteria and groups beneath it.
+
+    **Example Request**
+        PATCH api/cbe/v1/competencies/<tag_id>/criteria-groups/<group_id>/
+        ``{"logic_operator": "AND"}``
+
+    The response is the group as stored, in the criteria-tree endpoint's shape. ``logic_operator``
+    is the only editable field. The body may also repeat any other field the group's representation
+    carries, so a client can send back what it read, as long as each one matches what is stored.
+
+    A thin adapter: :func:`update_competency_criteria_group` makes every other refusal, including
+    the permission check, so an in-process caller is refused in the same cases. The body's fixed
+    fields are compared here, before that function runs, because only a REST body carries them.
+    """
+
+    serializer_class = CompetencyCriteriaGroupUpdateSerializer
+    http_method_names = ["patch"]
+    authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, tag_id: int, group_id: int):
+        """Check the body against the stored group, then delegate to the public API."""
+        # Same 404 the create and tree endpoints give a tag that isn't a competency, ahead of the body checks.
+        try:
+            resolve_competency_tag(tag_id)
+        except Tag.DoesNotExist as exc:
+            raise NotFound(str(exc)) from exc
+        # Scoped by tag_id, so addressing a group under a competency it doesn't belong to is a 404.
+        group = get_object_or_404(
+            CompetencyCriteriaGroup.objects.select_related("course"), pk=group_id, tag_id=tag_id,
+        )
+        serializer = self.get_serializer(group, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            group = update_competency_criteria_group(
+                group.id, logic_operator=serializer.validated_data["logic_operator"], user=request.user,
+            )
+        except DjangoValidationError as exc:
+            raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        except CompetencyCriteriaGroupArchivedError as exc:
+            raise CompetencyCriteriaConflict(str(exc)) from exc
+        return Response(CompetencyCriteriaGroupSerializer(group).data, status=status.HTTP_200_OK)
