@@ -33,8 +33,10 @@ __all__ = [
     "create_competency_criterion",
     "create_competency_taxonomy",
     "delete_competency_criterion",
+    "delete_competency_criteria_group",
     "get_competency_rule_profiles",
     "is_competency_taxonomy",
+    "resolve_competency_criteria_group_course",
     "resolve_competency_tag",
     "resolve_supplied_leaf_group",
     "select_competency_taxonomies",
@@ -444,3 +446,120 @@ def delete_competency_criterion(criterion_id: int) -> CriterionDeletionResult:
         with transaction.atomic():
             _archive_criterion(CompetencyCriterion.objects.select_for_update().get(pk=criterion_id))
         return CriterionDeletionResult(id=criterion_id, archived=True)
+
+
+@dataclass(frozen=True)
+class GroupDeletionResult:
+    """The outcome of :func:`delete_competency_criteria_group`, scoped to the target subtree only."""
+
+    id: int
+    archived: bool
+    cascaded_group_count: int
+    cascaded_criteria_count: int
+
+
+def resolve_competency_criteria_group_course(group: CompetencyCriteriaGroup) -> CourseRun:
+    """
+    Return the CourseRun that scopes the subtree rooted at ``group``.
+
+    UNSTABLE: the criteria-authoring family is incomplete, so its validation and group update
+    and archive behavior may change this function's shape without a deprecation cycle.
+
+    That is ``group``'s own course for a course-level group, else its parent's course. A caller
+    checks ``oel_tagging.can_tag_object`` against this course before removing the subtree.
+
+    Raises ValidationError (keyed "group_id") if ``group`` is a root CompetencyCriteriaGroup: a
+    root's subtree can span several courses, so there is no single course to check against.
+    """
+    if group.parent_id is None:
+        raise ValidationError({"group_id": _("group_id must not reference a root CompetencyCriteriaGroup.")})
+
+    if group.course_id is not None:
+        course = group.course
+    else:
+        parent = group.parent
+        assert parent is not None
+        course = parent.course
+    assert course is not None
+    return course
+
+
+def delete_competency_criteria_group(group_id: int) -> GroupDeletionResult:
+    """
+    Hard-delete the CompetencyCriteriaGroup subtree rooted at `group_id`, or archive it whole.
+
+    UNSTABLE: the criteria-authoring family is incomplete, so its validation and group update
+    and archive behavior may change this function's shape without a deprecation cycle.
+
+    The caller is expected to have already checked ``oel_tagging.can_tag_object`` against the
+    course :func:`resolve_competency_criteria_group_course` returns for the target group.
+
+    The subtree is the target group plus every descendant group and leaf CompetencyCriterion.
+    Hard-deleted if no learner status exists anywhere in it; archived in place, all-or-nothing,
+    if any does. Either way, :func:`_cascade_from_group` then runs above the target's own parent.
+
+    Raises CompetencyCriteriaGroup.DoesNotExist if no such group exists, and ValidationError
+    (keyed "group_id") if `group_id` names a root CompetencyCriteriaGroup.
+    """
+    target_group = CompetencyCriteriaGroup.objects.get(pk=group_id)
+    # Rejects a root target before any write.
+    resolve_competency_criteria_group_course(target_group)
+
+    all_group_ids = {target_group.id}
+    level_ids = [target_group.id]
+    while level_ids:
+        level_ids = list(
+            CompetencyCriteriaGroup.objects.filter(parent_id__in=level_ids).values_list("id", flat=True)
+        )
+        all_group_ids.update(level_ids)
+
+    criteria = list(CompetencyCriterion.objects.filter(group_id__in=all_group_ids))
+    criterion_ids = [criterion.id for criterion in criteria]
+    object_tag_ids = {criterion.object_tag_id for criterion in criteria}
+
+    has_status = (
+        StudentCompetencyCriteriaGroupStatus.objects.filter(group_id__in=all_group_ids).exists()
+        or StudentCompetencyCriterionStatus.objects.filter(criterion_id__in=criterion_ids).exists()
+    )
+
+    if not has_status:
+        with transaction.atomic():
+            parent_group = target_group.parent
+            tag = target_group.tag
+            target_group.delete()
+            for object_tag_id in object_tag_ids:
+                if not CompetencyCriterion.objects.filter(object_tag_id=object_tag_id).exists():
+                    object_tag = ObjectTag.objects.get(id=object_tag_id)
+                    existing_values = [
+                        t.value for t in get_object_tags(object_tag.object_id, taxonomy_id=tag.taxonomy_id)
+                        if t.value != tag.value
+                    ]
+                    tag_object(object_tag.object_id, tag.taxonomy, existing_values)
+            if parent_group is not None:
+                _cascade_from_group(parent_group, "delete")
+        return GroupDeletionResult(
+            id=group_id,
+            archived=False,
+            cascaded_group_count=len(all_group_ids) - 1,
+            cascaded_criteria_count=len(criterion_ids),
+        )
+
+    # Saves each row individually, not via .update(): a bulk update would silently skip
+    # simple_history, unlike delete_competency_criterion's own archive path. Wrapped in one
+    # transaction, like hard-delete above, so a failure partway through can't leave the subtree
+    # half-archived. Never touches any ObjectTag.
+    with transaction.atomic():
+        for group in CompetencyCriteriaGroup.objects.filter(id__in=all_group_ids):
+            group.archived = True
+            group.save()
+        for criterion in criteria:
+            criterion.archived = True
+            criterion.save()
+        if target_group.parent is not None:
+            _cascade_from_group(target_group.parent, "archive")
+    return GroupDeletionResult(
+        id=group_id,
+        archived=True,
+        cascaded_group_count=len(all_group_ids) - 1,
+        cascaded_criteria_count=len(criterion_ids),
+    )
