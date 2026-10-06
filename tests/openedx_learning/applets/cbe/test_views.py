@@ -11,7 +11,7 @@ import pytest
 import rules
 from django.urls import reverse
 from opaque_keys import InvalidKeyError
-from opaque_keys.edx.keys import UsageKey
+from opaque_keys.edx.keys import CourseKey, UsageKey
 from organizations.models import Organization
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -38,18 +38,22 @@ pytestmark = pytest.mark.django_db
 # checking"): real Studio-role logic lives only in openedx-platform, never in this repo. Following
 # tests/openedx_tagging/test_views.py's TestObjectTagViewSet.setUp() precedent, this override
 # simulates a permitted caller for every object_id except ones carrying this marker. Like the
-# platform's rule, it also denies an object_id that isn't a parseable usage key.
+# platform's rule, it also denies an object_id that is neither a parseable usage key nor a parseable
+# course key; the group-delete view checks permission against the subtree's course key.
 UNAUTHORIZED_MARKER = "unauthorized"
 
 
 @pytest.fixture(autouse=True)
 def _allow_object_level_tagging() -> Generator[None, None, None]:
-    """Let an ordinary authenticated user tag any usage key except one carrying UNAUTHORIZED_MARKER."""
+    """Let an ordinary authenticated user tag any usage or course key except one carrying UNAUTHORIZED_MARKER."""
     def _predicate(_user, object_id: str) -> bool:
         try:
             UsageKey.from_string(object_id)
         except InvalidKeyError:
-            return False
+            try:
+                CourseKey.from_string(object_id)
+            except InvalidKeyError:
+                return False
         return UNAUTHORIZED_MARKER not in object_id
 
     perm = "oel_tagging.change_objecttag_objectid"
@@ -74,6 +78,11 @@ def criterion_create_url(tag_id: int) -> str:
 def criterion_delete_url(tag_id: int, criterion_id: int) -> str:
     """Return the delete-criterion endpoint's path for `tag_id`/`criterion_id`, resolved through the URL name."""
     return reverse("cbe:criterion-delete", kwargs={"tag_id": tag_id, "criterion_id": criterion_id})
+
+
+def group_delete_url(tag_id: int, group_id: int) -> str:
+    """Return the delete-group endpoint's path for `tag_id`/`group_id`, resolved through the URL name."""
+    return reverse("cbe:group-delete", kwargs={"tag_id": tag_id, "group_id": group_id})
 
 
 def usage_key(course_run: CourseRun, block_id: str) -> str:
@@ -951,3 +960,216 @@ def test_delete_no_permission_is_403(
     response = user_client.delete(criterion_delete_url(tag.id, criterion.id))
 
     assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+# ==============================================================================================
+# CompetencyCriteriaGroupDeleteView (#675)
+# ==============================================================================================
+
+
+def test_group_hard_delete_200s_then_repeat_delete_404s(
+    user_client: APIClient, tag: Tag, course_run: CourseRun,
+) -> None:
+    """
+    Deleting an empty leaf group 200s, hard-deletes it, and reports zero cascade counts; a
+    repeat DELETE then 404s.
+    """
+    leaf = _create_leaf_group(tag, course_run)
+    url = group_delete_url(tag.id, leaf.id)
+
+    response = user_client.delete(url)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data == {
+        "id": leaf.id, "archived": False, "cascaded_group_count": 0, "cascaded_criteria_count": 0,
+    }
+    assert not CompetencyCriteriaGroup.objects.filter(id=leaf.id).exists()
+
+    repeat = user_client.delete(url)
+
+    assert repeat.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_group_cascade_hard_delete_200s_then_child_group_id_404s_on_subsequent_create(
+    user_client: APIClient, tag: Tag, course_run: CourseRun,
+) -> None:
+    """
+    Hard-deleting a course-level group cascade-deletes its child leaf group too, and a later
+    create-criterion POST naming that now-gone child group_id 404s rather than resolving.
+    """
+    leaf = _create_leaf_group(tag, course_run)
+    course_level = leaf.parent
+    assert course_level is not None
+
+    response = user_client.delete(group_delete_url(tag.id, course_level.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data["archived"] is False
+    assert response.data["cascaded_group_count"] == 1
+    assert response.data["cascaded_criteria_count"] == 0
+    assert not CompetencyCriteriaGroup.objects.filter(id=leaf.id).exists()
+
+    create_response = user_client.post(
+        criterion_create_url(tag.id),
+        {"object_id": usage_key(course_run, "p1"), "group_id": leaf.id},
+        format="json",
+    )
+
+    assert create_response.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_group_archive_200s_with_archived_true(
+    user_client: APIClient, *, user, tag: Tag, course_run: CourseRun,
+    default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """
+    Deleting a group whose criterion a learner status row references 200s, archives the
+    subtree, and reports archived=true.
+    """
+    leaf = _create_leaf_group(tag, course_run)
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+    criterion = CompetencyCriterion.objects.create(
+        group=leaf, object_tag=object_tag, rule_profile=default_rule_profile,
+    )
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    response = user_client.delete(group_delete_url(tag.id, leaf.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data == {
+        "id": leaf.id, "archived": True, "cascaded_group_count": 0, "cascaded_criteria_count": 1,
+    }
+    leaf.refresh_from_db()
+    assert leaf.archived is True
+
+
+def test_group_repeat_delete_on_an_archived_group_is_idempotent_200(
+    user_client: APIClient, *, user, tag: Tag, course_run: CourseRun,
+    default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """A second DELETE against an already-archived group subtree still 200s with the same body."""
+    leaf = _create_leaf_group(tag, course_run)
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+    criterion = CompetencyCriterion.objects.create(
+        group=leaf, object_tag=object_tag, rule_profile=default_rule_profile,
+    )
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+    url = group_delete_url(tag.id, leaf.id)
+    user_client.delete(url)
+
+    response = user_client.delete(url)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data == {
+        "id": leaf.id, "archived": True, "cascaded_group_count": 0, "cascaded_criteria_count": 1,
+    }
+
+
+def test_group_unknown_group_id_404s(user_client: APIClient, tag: Tag) -> None:
+    """A group_id with no matching row 404s."""
+    response = user_client.delete(group_delete_url(tag.id, 999999))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_group_tag_id_mismatch_404s(
+    user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, tag: Tag, course_run: CourseRun,
+) -> None:
+    """A group that exists, but under a different competency tag than the URL names, 404s."""
+    leaf = _create_leaf_group(tag, course_run)
+    other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Other Competency")
+
+    response = user_client.delete(group_delete_url(other_tag.id, leaf.id))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_group_root_target_is_400(user_client: APIClient, tag: Tag, course_run: CourseRun) -> None:
+    """A root group_id is rejected with a 400, not attempted as a deletable subtree."""
+    leaf = _create_leaf_group(tag, course_run)
+    course_level = leaf.parent
+    assert course_level is not None
+    root = course_level.parent
+    assert root is not None
+
+    response = user_client.delete(group_delete_url(tag.id, root.id))
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "group_id" in response.data
+
+
+def test_group_delete_no_permission_is_403(
+    user_client: APIClient, tag: Tag, organization: Organization,
+) -> None:
+    """A caller without object-level tagging permission on the subtree's course is refused with a 403."""
+    unauthorized_course_run = make_course_run(organization, f"{UNAUTHORIZED_MARKER}100", "Fall2026")
+    leaf = _create_leaf_group(tag, unauthorized_course_run)
+
+    response = user_client.delete(group_delete_url(tag.id, leaf.id))
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.fixture(name="checked_object_ids")
+def _checked_object_ids(_allow_object_level_tagging: None) -> Generator[list[str], None, None]:
+    """Record every object_id the object-level tagging predicate is asked about, then defer to it."""
+    perm = "oel_tagging.change_objecttag_objectid"
+    allowing = rules.permissions.permissions[perm]
+    seen: list[str] = []
+
+    def _recording_predicate(user, object_id: str) -> bool:
+        seen.append(object_id)
+        return allowing.test(user, object_id)
+
+    rules.set_perm(perm, _recording_predicate)
+    yield seen
+    rules.set_perm(perm, allowing)
+
+
+def test_group_delete_checks_permission_against_a_course_level_groups_own_course(
+    user_client: APIClient, tag: Tag, course_run: CourseRun, checked_object_ids: list[str],
+) -> None:
+    """A course-level target group is checked against its own course's key."""
+    leaf = _create_leaf_group(tag, course_run)
+    course_level = leaf.parent
+    assert course_level is not None
+
+    response = user_client.delete(group_delete_url(tag.id, course_level.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert checked_object_ids == [str(course_run.course_key)]
+
+
+def test_group_delete_checks_permission_against_the_parents_course_for_a_leaf_group(
+    user_client: APIClient, tag: Tag, course_run: CourseRun, checked_object_ids: list[str],
+) -> None:
+    """A leaf target group, which has no course of its own, is checked against its parent's course key."""
+    leaf = _create_leaf_group(tag, course_run)
+
+    response = user_client.delete(group_delete_url(tag.id, leaf.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert checked_object_ids == [str(course_run.course_key)]
+
+
+def test_group_root_target_is_400_before_any_permission_check_or_write(
+    user_client: APIClient, tag: Tag, course_run: CourseRun, checked_object_ids: list[str],
+) -> None:
+    """A root group_id is rejected before the permission predicate runs, and nothing under it changes."""
+    leaf = _create_leaf_group(tag, course_run)
+    course_level = leaf.parent
+    assert course_level is not None
+    root = course_level.parent
+    assert root is not None
+
+    response = user_client.delete(group_delete_url(tag.id, root.id))
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert not checked_object_ids
+    assert set(
+        CompetencyCriteriaGroup.objects.filter(archived=False).values_list("id", flat=True)
+    ) == {root.id, course_level.id, leaf.id}
