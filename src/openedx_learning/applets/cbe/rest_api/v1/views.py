@@ -22,11 +22,12 @@ from openedx_tagging.rules import ObjectTagPermissionItem
 
 from ...api import (
     associate_competency_criterion,
+    delete_competency_criteria_group,
     delete_competency_criterion,
     get_competency_rule_profiles,
     resolve_competency_tag,
 )
-from ...models import CompetencyCriterion, CompetencyRuleProfile
+from ...models import CompetencyCriteriaGroup, CompetencyCriterion, CompetencyRuleProfile
 from ..paginators import CompetencyRuleProfilePagination
 from .permissions import CompetencyRuleProfilePermissions
 from .serializers import CompetencyCriterionSerializer, CompetencyRuleProfileSerializer
@@ -146,3 +147,43 @@ class CompetencyCriterionDeleteView(generics.GenericAPIView):
         except DjangoPermissionDenied:
             raise PermissionDenied() from None
         return Response({"id": result.id, "archived": result.archived}, status=status.HTTP_200_OK)
+
+
+class CompetencyCriteriaGroupDeleteView(generics.GenericAPIView):
+    """
+    DELETE-only. Remove a CompetencyCriteriaGroup subtree: hard-delete, or archive it if learner status exists.
+
+    Does not call self.check_object_permissions(): oel_tagging.can_tag_object and the
+    root-group rejection are both checked inline inside delete_competency_criteria_group(),
+    the same pattern CompetencyCriterionDeleteView uses.
+    """
+
+    authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, *args, **kwargs):
+        """
+        Resolve the group scoped to both path segments, then delegate to the public API.
+
+        The lookup deliberately does not filter `archived=False`, so a repeat DELETE against an
+        already-archived subtree still resolves (200), and a mismatched tag_id or a nonexistent
+        group_id both 404 the same way, via this one get_object_or_404 call.
+        """
+        group = get_object_or_404(
+            CompetencyCriteriaGroup, pk=self.kwargs["group_id"], tag_id=self.kwargs["tag_id"],
+        )
+        try:
+            result = delete_competency_criteria_group(group.id, request.user)
+        except DjangoPermissionDenied:
+            raise PermissionDenied() from None
+        except DjangoValidationError as exc:
+            raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        return Response(
+            {
+                "id": result.id,
+                "archived": result.archived,
+                "cascaded_group_count": result.cascaded_group_count,
+                "cascaded_criteria_count": result.cascaded_criteria_count,
+            },
+            status=status.HTTP_200_OK,
+        )

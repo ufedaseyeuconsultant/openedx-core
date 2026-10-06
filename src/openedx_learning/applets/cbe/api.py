@@ -34,6 +34,7 @@ __all__ = [
     "associate_competency_criterion",
     "create_competency_criterion",
     "delete_competency_criterion",
+    "delete_competency_criteria_group",
     "get_competency_rule_profiles",
     "is_competency_taxonomy",
     "resolve_competency_tag",
@@ -345,3 +346,107 @@ def delete_competency_criterion(criterion_id: int, user: UserType) -> CriterionD
     criterion.save()
     _cascade_from_group(criterion.group, "archive")
     return CriterionDeletionResult(id=criterion_id, archived=True)
+
+
+@dataclass(frozen=True)
+class GroupDeletionResult:
+    """The outcome of :func:`delete_competency_criteria_group`, scoped to the target subtree only."""
+
+    id: int
+    archived: bool
+    cascaded_group_count: int
+    cascaded_criteria_count: int
+
+
+def delete_competency_criteria_group(group_id: int, user: UserType) -> GroupDeletionResult:
+    """
+    Hard-delete the CompetencyCriteriaGroup subtree rooted at `group_id`, or archive it whole.
+
+    The subtree is the target group plus every descendant group and leaf CompetencyCriterion.
+    Hard-deleted if no learner status exists anywhere in it; archived in place, all-or-nothing,
+    if any does. Either way, :func:`_cascade_from_group` then runs above the target's own parent.
+
+    Raises ValidationError (keyed "group_id") if `group_id` names a root CompetencyCriteriaGroup
+    (no single course to check permission against), Http404 if no such group exists, and Django's
+    PermissionDenied if `user` lacks oel_tagging.can_tag_object for the subtree's course.
+    """
+    target_group = get_object_or_404(CompetencyCriteriaGroup, pk=group_id)
+    if target_group.parent_id is None:
+        raise ValidationError({"group_id": _("group_id must not reference a root CompetencyCriteriaGroup.")})
+
+    if target_group.course_id is not None:
+        course = target_group.course
+    else:
+        parent = target_group.parent
+        assert parent is not None
+        course = parent.course
+    assert course is not None
+
+    taxonomy = target_group.tag.taxonomy
+    # Already guaranteed set: a persisted group's tag only ever came from resolve_competency_tag(),
+    # which requires a competency taxonomy. Doesn't cross the function boundary for mypy.
+    assert taxonomy is not None
+    perm_obj = ObjectTagPermissionItem(taxonomy=taxonomy, object_id=str(course.course_key))
+    # has_perm's obj arg is typed Model | None, but django-rules predicates take an
+    # ObjectTagPermissionItem; same mismatch openedx_tagging.rules already carries.
+    if not user.has_perm("oel_tagging.can_tag_object", perm_obj):  # type: ignore[arg-type]
+        raise PermissionDenied()
+
+    all_group_ids = {target_group.id}
+    level_ids = [target_group.id]
+    while level_ids:
+        level_ids = list(
+            CompetencyCriteriaGroup.objects.filter(parent_id__in=level_ids).values_list("id", flat=True)
+        )
+        all_group_ids.update(level_ids)
+
+    criteria = list(CompetencyCriterion.objects.filter(group_id__in=all_group_ids))
+    criterion_ids = [criterion.id for criterion in criteria]
+    object_tag_ids = {criterion.object_tag_id for criterion in criteria}
+
+    has_status = (
+        StudentCompetencyCriteriaGroupStatus.objects.filter(group_id__in=all_group_ids).exists()
+        or StudentCompetencyCriteriaStatus.objects.filter(criterion_id__in=criterion_ids).exists()
+    )
+
+    if not has_status:
+        with transaction.atomic():
+            parent_group = target_group.parent
+            tag = target_group.tag
+            target_group.delete()
+            for object_tag_id in object_tag_ids:
+                if not CompetencyCriterion.objects.filter(object_tag_id=object_tag_id).exists():
+                    object_tag = ObjectTag.objects.get(id=object_tag_id)
+                    existing_values = [
+                        t.value for t in get_object_tags(object_tag.object_id, taxonomy_id=tag.taxonomy_id)
+                        if t.value != tag.value
+                    ]
+                    tag_object(object_tag.object_id, tag.taxonomy, existing_values)
+            if parent_group is not None:
+                _cascade_from_group(parent_group, "delete")
+        return GroupDeletionResult(
+            id=group_id,
+            archived=False,
+            cascaded_group_count=len(all_group_ids) - 1,
+            cascaded_criteria_count=len(criterion_ids),
+        )
+
+    # Saves each row individually, not via .update(): a bulk update would silently skip
+    # simple_history, unlike delete_competency_criterion's own archive path. Wrapped in one
+    # transaction, like hard-delete above, so a failure partway through can't leave the subtree
+    # half-archived. Never touches any ObjectTag.
+    with transaction.atomic():
+        for group in CompetencyCriteriaGroup.objects.filter(id__in=all_group_ids):
+            group.archived = True
+            group.save()
+        for criterion in criteria:
+            criterion.archived = True
+            criterion.save()
+        if target_group.parent is not None:
+            _cascade_from_group(target_group.parent, "archive")
+    return GroupDeletionResult(
+        id=group_id,
+        archived=True,
+        cascaded_group_count=len(all_group_ids) - 1,
+        cascaded_criteria_count=len(criterion_ids),
+    )
