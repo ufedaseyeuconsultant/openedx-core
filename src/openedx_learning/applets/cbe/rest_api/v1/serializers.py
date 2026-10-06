@@ -76,11 +76,12 @@ class CompetencyCriterionSerializer(serializers.ModelSerializer):
     )
     rule_profile_id = serializers.IntegerField(required=False, allow_null=True)
     object_tag_id = serializers.IntegerField(read_only=True)
+    archived = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = CompetencyCriterion
         fields = [
             "id", "object_id", "group_id", "logic_operator",
-            "rule_profile_id", "rule_type_override", "rule_payload_override", "object_tag_id",
+            "rule_profile_id", "rule_type_override", "rule_payload_override", "object_tag_id", "archived",
         ]
-        read_only_fields = ["id", "object_tag_id"]
+        read_only_fields = ["id", "object_tag_id", "archived"]
