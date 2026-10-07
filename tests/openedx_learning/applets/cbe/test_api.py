@@ -1,14 +1,24 @@
 """
 Tests for the CBE public API surface (openedx_learning.api).
 """
+from collections.abc import Iterator
+
 import pytest
-from django.core.exceptions import ValidationError
+import rules
+from django.apps import apps
+from django.contrib.auth.models import User as UserType  # pylint: disable=imported-auth-user
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import connection
 from django.db.utils import IntegrityError
+from django.forms.models import model_to_dict
 from django.http import Http404
+from django.test.utils import CaptureQueriesContext
 from organizations.models import Organization
+from rules.permissions import permissions as rule_permissions
 
 from openedx_catalog.models import CatalogCourse, CourseRun
 from openedx_learning.api import (
+    CompetencyCriteriaGroupArchivedError,
     associate_competency_criterion,
     create_leaf_group,
     get_competency_criteria_tree,
@@ -16,6 +26,7 @@ from openedx_learning.api import (
     is_competency_taxonomy,
     resolve_supplied_leaf_group,
     select_competency_taxonomies,
+    update_competency_criteria_group,
 )
 from openedx_learning.applets.cbe import api as cbe_api
 from openedx_learning.models import (
@@ -586,3 +597,352 @@ def test_get_competency_criteria_tree_costs_a_bounded_number_of_queries(
             _ = group.course  # accessing the select_related'd relation must not add a query
         for criterion in tree.criteria:
             _ = criterion.object_tag
+
+
+# ==============================================================================================
+# update_competency_criteria_group (#760)
+# ==============================================================================================
+
+CHANGE_OBJECTTAG_OBJECTID = "oel_tagging.change_objecttag_objectid"
+
+
+@pytest.fixture(name="checked_object_ids", autouse=True)
+def _checked_object_ids() -> Iterator[list[str]]:
+    """
+    Let any user tag any object, recording each object_id checked; restore the real rule afterwards.
+
+    openedx_tagging denies change_objecttag_objectid to everyone and leaves the real Studio-role
+    check to openedx-platform, so these tests substitute a permissive one.
+    """
+    original = rule_permissions[CHANGE_OBJECTTAG_OBJECTID]
+    checked: list[str] = []
+
+    def _predicate(_user: UserType, object_id: str) -> bool:
+        checked.append(object_id)
+        return True
+
+    rules.set_perm(CHANGE_OBJECTTAG_OBJECTID, _predicate)
+    yield checked
+    rules.set_perm(CHANGE_OBJECTTAG_OBJECTID, original)
+
+
+@pytest.fixture(name="leaf")
+def _leaf(tag: Tag, course_run: CourseRun) -> CompetencyCriteriaGroup:
+    """A leaf group under `tag` and `course_run`. Only a leaf group holds criteria."""
+    return create_leaf_group(tag, course_run)
+
+
+def course_level_of(leaf: CompetencyCriteriaGroup) -> CompetencyCriteriaGroup:
+    """Return the course-level group `leaf` sits under."""
+    assert leaf.parent is not None
+    return leaf.parent
+
+
+def root_of(leaf: CompetencyCriteriaGroup) -> CompetencyCriteriaGroup:
+    """Return the root group of `leaf`'s tree."""
+    root = course_level_of(leaf).parent
+    assert root is not None
+    return root
+
+
+def make_criterion(leaf: CompetencyCriteriaGroup, block_id: str, **rule) -> CompetencyCriterion:
+    """Create a criterion on `leaf` for a fresh object in its course, with `rule` as its rule columns."""
+    assert leaf.parent is not None and leaf.parent.course is not None
+    object_tag = ObjectTag.objects.create(
+        object_id=usage_key(leaf.parent.course, block_id), taxonomy=leaf.tag.taxonomy, tag=leaf.tag,
+    )
+    return CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, **rule)
+
+
+def with_operator(group: CompetencyCriteriaGroup, logic_operator: str | None) -> CompetencyCriteriaGroup:
+    """Store `logic_operator` on `group` directly, as the starting state for a test."""
+    group.logic_operator = logic_operator
+    group.save()
+    return group
+
+
+def group_history(group: CompetencyCriteriaGroup):
+    """
+    Return `group`'s history rows, newest first.
+
+    Looked up through the app registry, as the model tests do, because simple_history's `.history`
+    descriptor has no type stubs.
+    """
+    historical_group = apps.get_model("openedx_learning", "HistoricalCompetencyCriteriaGroup")
+    return historical_group.objects.filter(id=group.pk).order_by("-history_date", "-history_id")
+
+
+def stored(group: CompetencyCriteriaGroup) -> tuple[dict, int]:
+    """Return `group`'s columns as stored and its history length, to show what a call changed."""
+    return model_to_dict(CompetencyCriteriaGroup.objects.get(pk=group.pk)), group_history(group).count()
+
+
+@pytest.mark.parametrize("level", ["course-level", "leaf"])
+@pytest.mark.parametrize(
+    "before, after", [(LogicOperator.AND, LogicOperator.OR), (LogicOperator.OR, LogicOperator.AND)],
+)
+def test_update_switches_how_a_group_combines_its_children(
+    level: str, before: str, after: str, leaf: CompetencyCriteriaGroup, user: UserType,
+) -> None:
+    """Either operator replaces the other, on a course-level group and on a leaf alike."""
+    group = with_operator(course_level_of(leaf) if level == "course-level" else leaf, before)
+
+    result = update_competency_criteria_group(group.id, logic_operator=after, user=user)
+
+    assert result.logic_operator == after
+    group.refresh_from_db()
+    assert group.logic_operator == after
+
+
+def test_update_writes_one_history_row_attributed_to_the_caller(
+    leaf: CompetencyCriteriaGroup, user: UserType,
+) -> None:
+    """A real change is one save, so one history row, attributed without any request middleware."""
+    rows_before = group_history(leaf).count()
+
+    update_competency_criteria_group(leaf.id, logic_operator=LogicOperator.AND, user=user)
+
+    assert group_history(leaf).count() == rows_before + 1
+    latest = group_history(leaf).first()
+    assert latest.history_user == user
+    assert latest.logic_operator == LogicOperator.AND
+
+
+def test_update_that_changes_nothing_saves_nothing(leaf: CompetencyCriteriaGroup, user: UserType) -> None:
+    """Asking for the operator a group already has succeeds without adding a history row."""
+    assert leaf.logic_operator == LogicOperator.OR
+    before = stored(leaf)
+
+    result = update_competency_criteria_group(leaf.id, logic_operator=LogicOperator.OR, user=user)
+
+    assert result.logic_operator == LogicOperator.OR
+    assert stored(leaf) == before
+
+
+def test_update_sets_an_unset_operator_even_to_or(leaf: CompetencyCriteriaGroup, user: UserType) -> None:
+    """
+    A null operator given OR is a real change.
+
+    Null is evaluated like OR, but it is stored differently, and the caller asked for an explicit value.
+    """
+    course_level = course_level_of(leaf)
+    assert course_level.logic_operator is None
+    rows_before = group_history(course_level).count()
+
+    update_competency_criteria_group(course_level.id, logic_operator=LogicOperator.OR, user=user)
+
+    course_level.refresh_from_db()
+    assert course_level.logic_operator == LogicOperator.OR
+    assert group_history(course_level).count() == rows_before + 1
+
+
+def test_update_leaves_everything_else_about_the_group_and_its_branch_unchanged(
+    leaf: CompetencyCriteriaGroup, user: UserType, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """Only the operator changes: not the group's name, ordering, competency, course, or parent, nor anything below."""
+    course_level = with_operator(course_level_of(leaf), LogicOperator.AND)
+    # A non-default ordering, so that a reset to the default would show.
+    course_level.ordering = 3
+    course_level.save()
+    criterion = make_criterion(leaf, "p1", rule_profile=default_rule_profile)
+    group_before, _ = stored(course_level)
+    leaf_before = stored(leaf)
+    criterion_before = model_to_dict(criterion)
+
+    update_competency_criteria_group(course_level.id, logic_operator=LogicOperator.OR, user=user)
+
+    group_after, _ = stored(course_level)
+    assert group_after == {**group_before, "logic_operator": LogicOperator.OR}
+    assert stored(leaf) == leaf_before
+    assert model_to_dict(CompetencyCriterion.objects.get(pk=criterion.pk)) == criterion_before
+
+
+@pytest.mark.parametrize("children", [0, 1])
+def test_update_accepts_a_group_with_fewer_than_two_children(
+    children: int, leaf: CompetencyCriteriaGroup, user: UserType, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A group's child count is creation's and deletion's concern, so it never blocks this edit."""
+    for n in range(children):
+        make_criterion(leaf, f"p{n}", rule_profile=default_rule_profile)
+
+    result = update_competency_criteria_group(leaf.id, logic_operator=LogicOperator.AND, user=user)
+
+    assert result.logic_operator == LogicOperator.AND
+
+
+@pytest.mark.parametrize("logic_operator", [None, "", "XOR", "and", 1])
+def test_update_rejects_an_operator_the_group_cannot_store(
+    logic_operator, leaf: CompetencyCriteriaGroup, user: UserType,
+) -> None:
+    """Anything but AND or OR is refused, keyed by the field, and the group keeps its operator."""
+    before = stored(leaf)
+
+    with pytest.raises(ValidationError) as exc_info:
+        update_competency_criteria_group(leaf.id, logic_operator=logic_operator, user=user)
+
+    assert "logic_operator" in exc_info.value.message_dict
+    assert stored(leaf) == before
+
+
+@pytest.mark.parametrize("logic_operator", [LogicOperator.OR, LogicOperator.AND])
+def test_update_refuses_an_archived_group_even_when_nothing_would_change(
+    logic_operator: str, leaf: CompetencyCriteriaGroup, user: UserType,
+) -> None:
+    """
+    An archived group is refused outright, whatever the request.
+
+    Asking for the operator it already has is refused too. That pins the archived check ahead of the
+    no-op check, since a success would suggest the edit was accepted.
+    """
+    leaf.archived = True
+    leaf.save()
+    before = stored(leaf)
+
+    with pytest.raises(CompetencyCriteriaGroupArchivedError):
+        update_competency_criteria_group(leaf.id, logic_operator=logic_operator, user=user)
+
+    assert stored(leaf) == before
+
+
+def test_update_rejects_a_root_group_before_checking_permission(
+    checked_object_ids: list[str], leaf: CompetencyCriteriaGroup, user: UserType,
+) -> None:
+    """A root spans every course beneath it, so it is refused before any permission check or write."""
+    root = with_operator(root_of(leaf), LogicOperator.AND)
+    before = stored(root)
+
+    with pytest.raises(ValidationError, match="root") as exc_info:
+        update_competency_criteria_group(root.id, logic_operator=LogicOperator.OR, user=user)
+
+    assert "group_id" in exc_info.value.message_dict
+    assert not checked_object_ids
+    assert stored(root) == before
+
+
+def test_update_does_not_mistake_a_course_less_child_of_the_root_for_a_root(
+    checked_object_ids: list[str], tag: Tag, leaf: CompetencyCriteriaGroup, user: UserType,
+) -> None:
+    """
+    A group with a parent is no root, even with no course of its own and none above it.
+
+    The model and ADR-0002 allow such a group, but with no course anywhere above it there's nothing to check
+    permission against. So it's refused, for that reason and not as a root, before any permission check or write.
+    """
+    course_less = CompetencyCriteriaGroup.objects.create(
+        tag=tag, parent=root_of(leaf), logic_operator=LogicOperator.AND,
+    )
+    before = stored(course_less)
+
+    with pytest.raises(ValidationError, match="no course") as exc_info:
+        update_competency_criteria_group(course_less.id, logic_operator=LogicOperator.OR, user=user)
+
+    assert "root" not in str(exc_info.value)
+    assert "group_id" in exc_info.value.message_dict
+    assert not checked_object_ids
+    assert stored(course_less) == before
+
+
+def test_update_resolves_the_course_of_a_group_nested_below_a_leaf(
+    checked_object_ids: list[str], leaf: CompetencyCriteriaGroup, user: UserType, course_run: CourseRun,
+) -> None:
+    """ADR-0002 supports deeply nested groups, so one below a leaf takes the course of its nearest ancestor with one."""
+    nested = CompetencyCriteriaGroup.objects.create(tag=leaf.tag, parent=leaf, logic_operator=LogicOperator.OR)
+
+    result = update_competency_criteria_group(nested.id, logic_operator=LogicOperator.AND, user=user)
+
+    assert result.logic_operator == LogicOperator.AND
+    nested.refresh_from_db()
+    assert nested.logic_operator == LogicOperator.AND
+    assert checked_object_ids == [str(course_run.course_key)]
+
+
+def test_update_404s_for_a_group_whose_tag_is_not_on_a_competency_taxonomy(
+    checked_object_ids: list[str], course_run: CourseRun, user: UserType,
+) -> None:
+    """A group under any other kind of taxonomy isn't a competency's group, so it's missing, and nothing changes."""
+    plain_tag = Tag.objects.create(taxonomy=Taxonomy.objects.create(name="Plain Tags", export_id="plain-v1"), value="x")
+    root = CompetencyCriteriaGroup.objects.create(tag=plain_tag, parent=None)
+    # Shaped like any editable group, so only its taxonomy sets it apart.
+    course_level = CompetencyCriteriaGroup.objects.create(
+        tag=plain_tag, course=course_run, parent=root, logic_operator=LogicOperator.AND,
+    )
+    before = stored(course_level)
+
+    with pytest.raises(Http404):
+        update_competency_criteria_group(course_level.id, logic_operator=LogicOperator.OR, user=user)
+
+    assert not checked_object_ids
+    assert stored(course_level) == before
+
+
+def test_update_404s_for_a_group_that_does_not_exist(user: UserType) -> None:
+    """An unknown group id is a missing resource."""
+    with pytest.raises(Http404):
+        update_competency_criteria_group(999999, logic_operator=LogicOperator.AND, user=user)
+
+
+@pytest.mark.parametrize("level", ["course-level", "leaf"])
+def test_update_checks_permission_against_the_groups_course(  # pylint: disable=too-many-positional-arguments
+    level: str,
+    checked_object_ids: list[str],
+    leaf: CompetencyCriteriaGroup,
+    user: UserType,
+    course_run: CourseRun,
+    organization: Organization,
+) -> None:
+    """A course-level group's own course is checked, and a leaf's is resolved through its course-level parent."""
+    # Another course under the same root, so checking any course but the group's own would show.
+    create_leaf_group(leaf.tag, make_course_run(organization, "Python200", "Fall2026"))
+    group = course_level_of(leaf) if level == "course-level" else leaf
+
+    update_competency_criteria_group(group.id, logic_operator=LogicOperator.AND, user=user)
+
+    assert checked_object_ids == [str(course_run.course_key)]
+
+
+@pytest.mark.parametrize("lacks", ["course write access", "taxonomy view access"])
+def test_update_refuses_a_user_without_permission_changing_nothing(
+    lacks: str, leaf: CompetencyCriteriaGroup, user: UserType, competency_taxonomy: CompetencyTaxonomy,
+) -> None:
+    """A user failing oel_tagging.can_tag_object's taxonomy check or object_id check is refused, and nothing changes."""
+    if lacks == "course write access":
+        rules.set_perm(CHANGE_OBJECTTAG_OBJECTID, lambda _user, _object_id: False)
+    else:
+        # can_tag_object's taxonomy check fails on a disabled taxonomy for anyone but a superuser.
+        competency_taxonomy.enabled = False
+        competency_taxonomy.save()
+    before = stored(leaf)
+
+    with pytest.raises(PermissionDenied):
+        update_competency_criteria_group(leaf.id, logic_operator=LogicOperator.AND, user=user)
+
+    assert stored(leaf) == before
+
+
+@pytest.mark.parametrize("path", ["changed", "no-op", "archived", "root", "unsupported operator"])
+def test_update_never_reads_or_writes_learner_status(
+    path: str, leaf: CompetencyCriteriaGroup, user: UserType,
+) -> None:
+    """
+    No path issues a query against a StudentCompetency*Status table.
+
+    Whether learners have progress under a group plays no part in this edit; warning about that is #723's job.
+    """
+    group, logic_operator = leaf, str(LogicOperator.AND)
+    if path == "no-op":
+        logic_operator = LogicOperator.OR
+    elif path == "archived":
+        leaf.archived = True
+        leaf.save()
+    elif path == "root":
+        group = root_of(leaf)
+    elif path == "unsupported operator":
+        logic_operator = "XOR"
+
+    with CaptureQueriesContext(connection) as queries:
+        try:
+            update_competency_criteria_group(group.id, logic_operator=logic_operator, user=user)
+        except (ValidationError, CompetencyCriteriaGroupArchivedError):
+            pass
+
+    assert not [q for q in queries.captured_queries if "studentcompetency" in q["sql"].lower()]

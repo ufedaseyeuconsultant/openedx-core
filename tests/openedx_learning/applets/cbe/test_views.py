@@ -4,6 +4,8 @@ Tests for the CBE REST API views.
 Fixtures live in this directory's conftest.py. Several scenarios here create rule profile rows
 directly rather than through a live call, because no create or archive endpoint exists yet.
 """
+from typing import Any
+
 import pytest
 import rules
 from django.contrib.auth.models import User as UserType  # pylint: disable=imported-auth-user
@@ -791,3 +793,322 @@ def test_no_view_access_to_the_taxonomy_is_403(api_client: APIClient, user: User
     response = api_client.get(criteria_tree_url(tag.id))
 
     assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+# ==============================================================================================
+# CompetencyCriteriaGroupDetailView (#760)
+# ==============================================================================================
+
+GROUP_FIELDS = {"id", "parent_id", "tag_id", "course_key", "name", "ordering", "logic_operator", "archived"}
+
+
+def group_detail_url(tag_id: int, group_id: int) -> str:
+    """Return the group detail endpoint's path, resolved through the URL name."""
+    return reverse("cbe:criteria-group-detail", kwargs={"tag_id": tag_id, "group_id": group_id})
+
+
+@pytest.fixture(name="leaf")
+def _leaf(tag: Tag, course_run: CourseRun) -> CompetencyCriteriaGroup:
+    """A leaf group under `tag` and `course_run`. Only a leaf group holds criteria."""
+    return create_leaf_group(tag, course_run)
+
+
+@pytest.fixture(name="course_level")
+def _course_level(leaf: CompetencyCriteriaGroup) -> CompetencyCriteriaGroup:
+    """The course-level group `leaf` sits under, combining its children with AND."""
+    course_level = leaf.parent
+    assert course_level is not None
+    course_level.logic_operator = LogicOperator.AND
+    course_level.save()
+    return course_level
+
+
+def stored_group(group: CompetencyCriteriaGroup) -> tuple:
+    """Return `group`'s columns as stored, to prove a refused request changed nothing."""
+    group.refresh_from_db()
+    return (
+        group.logic_operator, group.name, group.ordering, group.tag_id, group.course_id, group.parent_id,
+        group.archived,
+    )
+
+
+def test_group_detail_resolves_to_the_documented_path() -> None:
+    """The group's own route sits under the competency's criteria-groups collection."""
+    assert group_detail_url(7, 9) == "/api/cbe/v1/competencies/7/criteria-groups/9/"
+
+
+@pytest.mark.parametrize(
+    "before, after", [(LogicOperator.AND, LogicOperator.OR), (LogicOperator.OR, LogicOperator.AND)],
+)
+def test_update_group_switches_its_operator_and_echoes_the_rest(  # pylint: disable=too-many-positional-arguments
+    before: str,
+    after: str,
+    user_client: APIClient,
+    tag: Tag,
+    course_run: CourseRun,
+    course_level: CompetencyCriteriaGroup,
+) -> None:
+    """The response is the group as stored: the new operator, everything else as before."""
+    course_level.logic_operator = before
+    course_level.save()
+
+    response = user_client.patch(group_detail_url(tag.id, course_level.id), {"logic_operator": after}, format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    assert set(response.data.keys()) == GROUP_FIELDS
+    assert response.data["logic_operator"] == after
+    assert response.data["id"] == course_level.id
+    assert response.data["name"] == course_level.name
+    assert response.data["ordering"] == course_level.ordering
+    assert response.data["tag_id"] == tag.id
+    assert response.data["course_key"] == str(course_run.course_key)
+    assert response.data["parent_id"] == course_level.parent_id
+    assert response.data["archived"] is False
+
+
+def test_update_group_accepts_back_the_representation_the_tree_endpoint_gave(
+    user_client: APIClient, tag: Tag, course_level: CompetencyCriteriaGroup,
+) -> None:
+    """A client can read the group, change only its operator, and send the whole object back."""
+    tree = user_client.get(criteria_tree_url(tag.id))
+    read = next(group for group in tree.data["groups"] if group["id"] == course_level.id)
+
+    response = user_client.patch(
+        group_detail_url(tag.id, course_level.id), {**read, "logic_operator": LogicOperator.OR}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data == {**read, "logic_operator": LogicOperator.OR}
+
+
+@pytest.mark.parametrize("sent, expected_status", [
+    ("  Padded name  ", status.HTTP_200_OK),
+    ("Padded name", status.HTTP_400_BAD_REQUEST),
+    ("  padded name  ", status.HTTP_400_BAD_REQUEST),
+])
+def test_update_group_compares_a_restated_name_exactly(
+    sent: str,
+    expected_status: int,
+    user_client: APIClient,
+    tag: Tag,
+    course_level: CompetencyCriteriaGroup,
+) -> None:
+    """A restated name matches only if it is identical, so neither trimming nor a change of case gets through."""
+    course_level.name = "  Padded name  "
+    course_level.save()
+
+    response = user_client.patch(
+        group_detail_url(tag.id, course_level.id), {"logic_operator": LogicOperator.OR, "name": sent}, format="json",
+    )
+
+    assert response.status_code == expected_status
+
+
+def test_update_group_that_changes_nothing_is_200(
+    user_client: APIClient, tag: Tag, course_level: CompetencyCriteriaGroup,
+) -> None:
+    """Sending the operator the group already has succeeds and reports it."""
+    response = user_client.patch(
+        group_detail_url(tag.id, course_level.id), {"logic_operator": LogicOperator.AND}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data["logic_operator"] == LogicOperator.AND
+
+
+@pytest.mark.parametrize(
+    "case, error_key",
+    [
+        ("missing operator", "logic_operator"),
+        ("null operator", "logic_operator"),
+        ("unsupported operator", "logic_operator"),
+        ("unrecognized key", "children"),
+        ("rename", "name"),
+        ("reorder", "ordering"),
+        ("re-parent", "parent_id"),
+        ("change course", "course_key"),
+        ("change competency", "tag_id"),
+        ("archive", "archived"),
+        ("change id", "id"),
+    ],
+)
+def test_update_group_rejects_a_malformed_body_with_400(  # pylint: disable=too-many-positional-arguments
+    case: str,
+    error_key: str,
+    user_client: APIClient,
+    tag: Tag,
+    leaf: CompetencyCriteriaGroup,
+    course_level: CompetencyCriteriaGroup,
+) -> None:
+    """Each malformed body is a 400 naming the offending field, and the group is unchanged."""
+    change = {"logic_operator": LogicOperator.OR}
+    bodies: dict[str, dict[str, Any]] = {
+        "missing operator": {},
+        "null operator": {"logic_operator": None},
+        "unsupported operator": {"logic_operator": "XOR"},
+        # A group's membership is not this endpoint's to change.
+        "unrecognized key": {**change, "children": [leaf.id]},
+        "rename": {**change, "name": "Renamed"},
+        "reorder": {**change, "ordering": course_level.ordering + 1},
+        "re-parent": {**change, "parent_id": None},
+        "change course": {**change, "course_key": "course-v1:Org1+Other+Run"},
+        "change competency": {**change, "tag_id": tag.id + 1},
+        "archive": {**change, "archived": True},
+        "change id": {**change, "id": leaf.id},
+    }
+    before = stored_group(course_level)
+
+    response = user_client.patch(group_detail_url(tag.id, course_level.id), bodies[case], format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert error_key in response.data
+    assert stored_group(course_level) == before
+
+
+def test_update_root_group_is_400(user_client: APIClient, tag: Tag, course_level: CompetencyCriteriaGroup) -> None:
+    """A root group is refused with a 400 saying roots cannot be targeted, and it is unchanged."""
+    root = course_level.parent
+    assert root is not None
+    before = stored_group(root)
+
+    response = user_client.patch(
+        group_detail_url(tag.id, root.id), {"logic_operator": LogicOperator.AND}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "root" in str(response.data["group_id"])
+    assert stored_group(root) == before
+
+
+def test_update_course_less_child_of_the_root_is_400_but_not_as_a_root(
+    user_client: APIClient, tag: Tag, course_level: CompetencyCriteriaGroup,
+) -> None:
+    """A group with a parent but no course anywhere above it is refused for having no course, not as a root."""
+    root = course_level.parent
+    assert root is not None
+    course_less = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root, logic_operator=LogicOperator.AND)
+    before = stored_group(course_less)
+
+    response = user_client.patch(
+        group_detail_url(tag.id, course_less.id), {"logic_operator": LogicOperator.OR}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "no course" in str(response.data["group_id"])
+    assert "root" not in str(response.data["group_id"])
+    assert stored_group(course_less) == before
+
+
+def test_update_group_nested_below_a_leaf_is_200(
+    user_client: APIClient, tag: Tag, leaf: CompetencyCriteriaGroup,
+) -> None:
+    """A group nested below a leaf is editable, its course coming from the nearest ancestor that has one."""
+    nested = CompetencyCriteriaGroup.objects.create(tag=tag, parent=leaf, logic_operator=LogicOperator.OR)
+
+    response = user_client.patch(
+        group_detail_url(tag.id, nested.id), {"logic_operator": LogicOperator.AND}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data["logic_operator"] == LogicOperator.AND
+
+
+def test_update_group_under_a_tag_that_is_not_a_competency_is_404(
+    user_client: APIClient, course_run: CourseRun,
+) -> None:
+    """A group under a non-competency taxonomy is a missing resource, and it is unchanged."""
+    plain_tag = Tag.objects.create(taxonomy=Taxonomy.objects.create(name="Plain Tags", export_id="plain-v1"), value="x")
+    root = CompetencyCriteriaGroup.objects.create(tag=plain_tag, parent=None)
+    # Shaped like any editable group, so only its taxonomy sets it apart.
+    course_level = CompetencyCriteriaGroup.objects.create(
+        tag=plain_tag, course=course_run, parent=root, logic_operator=LogicOperator.AND,
+    )
+    before = stored_group(course_level)
+
+    # The mismatched name would be a 400 if the body were checked before the tag, as it isn't on the other endpoints.
+    response = user_client.patch(
+        group_detail_url(plain_tag.id, course_level.id),
+        {"logic_operator": LogicOperator.OR, "name": "Renamed"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert stored_group(course_level) == before
+
+
+def test_update_group_addressed_under_another_competency_is_404(
+    user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, course_level: CompetencyCriteriaGroup,
+) -> None:
+    """A group addressed through a competency it doesn't belong to doesn't exist there, and is unchanged."""
+    other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Reading Poetry")
+    before = stored_group(course_level)
+
+    response = user_client.patch(
+        group_detail_url(other_tag.id, course_level.id), {"logic_operator": LogicOperator.OR}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert stored_group(course_level) == before
+
+
+def test_update_group_that_does_not_exist_is_404(user_client: APIClient, tag: Tag) -> None:
+    """An unknown group id in the URL is a missing resource."""
+    response = user_client.patch(group_detail_url(tag.id, 999999), {"logic_operator": LogicOperator.OR}, format="json")
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_update_archived_group_is_409(user_client: APIClient, tag: Tag, leaf: CompetencyCriteriaGroup) -> None:
+    """An archived group conflicts with any edit, and stays archived and otherwise unchanged."""
+    leaf.archived = True
+    leaf.save()
+    before = stored_group(leaf)
+
+    response = user_client.patch(
+        group_detail_url(tag.id, leaf.id), {"logic_operator": LogicOperator.AND}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert "archived" in str(response.data["detail"])
+    assert stored_group(leaf) == before
+
+
+@pytest.mark.parametrize("lacks", ["course write access", "taxonomy view access"])
+def test_update_group_without_permission_is_403(
+    lacks: str, user_client: APIClient, tag: Tag, organization: Organization,
+) -> None:
+    """A caller who may not tag objects in the group's course, or may not view its taxonomy, is refused."""
+    course_code = UNAUTHORIZED_MARKER if lacks == "course write access" else "Python200"
+    leaf = create_leaf_group(tag, make_course_run(organization, course_code, "Fall2026"))
+    if lacks == "taxonomy view access":
+        taxonomy = tag.taxonomy
+        assert taxonomy is not None
+        taxonomy.enabled = False
+        taxonomy.save()
+    before = stored_group(leaf)
+
+    response = user_client.patch(
+        group_detail_url(tag.id, leaf.id), {"logic_operator": LogicOperator.AND}, format="json",
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert stored_group(leaf) == before
+
+
+def test_update_group_from_an_unidentified_caller_is_401(
+    api_client: APIClient, tag: Tag, leaf: CompetencyCriteriaGroup,
+) -> None:
+    """A caller the system cannot identify is refused before anything is read."""
+    response = api_client.patch(group_detail_url(tag.id, leaf.id), {"logic_operator": LogicOperator.AND}, format="json")
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+@pytest.mark.parametrize("method", ["get", "put", "post", "delete"])
+def test_group_detail_offers_only_patch(
+    method: str, user_client: APIClient, tag: Tag, leaf: CompetencyCriteriaGroup,
+) -> None:
+    """Every method other than PATCH, PUT included, is refused as not allowed."""
+    response = getattr(user_client, method)(group_detail_url(tag.id, leaf.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED

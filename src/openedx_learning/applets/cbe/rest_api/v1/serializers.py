@@ -103,6 +103,39 @@ class CompetencyCriteriaGroupSerializer(serializers.ModelSerializer):
         fields = ["id", "parent_id", "tag_id", "course_key", "name", "ordering", "logic_operator", "archived"]
 
 
+class CompetencyCriteriaGroupUpdateSerializer(serializers.Serializer):  # pylint: disable=abstract-method
+    """
+    Parse the group-update request body against the stored group, which is this serializer's instance.
+
+    ``logic_operator`` is required and is the only field that can change. Its type is checked here,
+    and its value is checked by :func:`update_competency_criteria_group`. Every other field that
+    CompetencyCriteriaGroupSerializer emits is accepted too, so a client can send back the group it
+    read. Each one must match what is stored, and the error names any that don't. A mismatch is a
+    rejected edit, not something to ignore silently.
+    """
+
+    logic_operator = serializers.CharField()
+    id = serializers.IntegerField(required=False)
+    parent_id = serializers.IntegerField(required=False, allow_null=True)
+    tag_id = serializers.IntegerField(required=False)
+    course_key = serializers.CharField(required=False, allow_null=True)
+    # Compared as sent: trimming would turn an exact echo of a padded name into an apparent rename.
+    name = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+    ordering = serializers.IntegerField(required=False)
+    archived = serializers.BooleanField(required=False)
+
+    def validate(self, attrs: dict) -> dict:
+        """Reject any key this serializer does not declare, and any fixed field that differs from the stored one."""
+        unrecognized = sorted(set(self.initial_data) - set(self.fields))
+        if unrecognized:
+            raise serializers.ValidationError({key: "This field is not recognized." for key in unrecognized})
+        stored = CompetencyCriteriaGroupSerializer(self.instance).data
+        changed = sorted(key for key, value in attrs.items() if key != "logic_operator" and value != stored[key])
+        if changed:
+            raise serializers.ValidationError({key: "This field cannot be changed." for key in changed})
+        return attrs
+
+
 class CompetencyCriterionReadSerializer(serializers.ModelSerializer):
     """
     Read-only representation of a CompetencyCriterion, for the criteria-tree read endpoint.

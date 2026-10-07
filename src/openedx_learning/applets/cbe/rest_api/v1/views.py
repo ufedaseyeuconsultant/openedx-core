@@ -5,12 +5,14 @@ from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import QuerySet
+from django.shortcuts import get_object_or_404
+from django.utils.translation import gettext_lazy as _
 from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthentication  # type: ignore[import]
 from edx_rest_framework_extensions.auth.session.authentication import (  # type: ignore[import]
     SessionAuthenticationAllowInactiveUser,
 )
 from rest_framework import generics, mixins, status
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import APIException, PermissionDenied
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -19,16 +21,19 @@ from rest_framework.viewsets import GenericViewSet
 from openedx_tagging.rules import ObjectTagPermissionItem
 
 from ...api import (
+    CompetencyCriteriaGroupArchivedError,
     associate_competency_criterion,
     get_competency_criteria_tree,
     get_competency_rule_profiles,
     resolve_competency_tag,
+    update_competency_criteria_group,
 )
-from ...models import CompetencyRuleProfile
+from ...models import CompetencyCriteriaGroup, CompetencyRuleProfile
 from ..paginators import CompetencyRuleProfilePagination
 from .permissions import CompetencyReadPermission, CompetencyRuleProfilePermissions
 from .serializers import (
     CompetencyCriteriaGroupSerializer,
+    CompetencyCriteriaGroupUpdateSerializer,
     CompetencyCriterionReadSerializer,
     CompetencyCriterionSerializer,
     CompetencyRuleProfileSerializer,
@@ -140,3 +145,52 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
             "groups": CompetencyCriteriaGroupSerializer(tree.groups, many=True).data,
             "criteria": CompetencyCriterionReadSerializer(tree.criteria, many=True).data,
         })
+
+
+class CompetencyCriteriaConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = _("The request conflicts with the current state of the competency criteria it names.")
+    default_code = "conflict"
+
+
+class CompetencyCriteriaGroupDetailView(generics.GenericAPIView):
+    """
+    PATCH-only. Change how one CompetencyCriteriaGroup combines the criteria and groups beneath it.
+
+    **Example Request**
+        PATCH api/cbe/v1/competencies/<tag_id>/criteria-groups/<group_id>/
+        ``{"logic_operator": "AND"}``
+
+    The response is the group as stored, in the criteria-tree endpoint's shape. ``logic_operator``
+    is the only editable field. The body may also repeat any other field the group's representation
+    carries, so a client can send back what it read, as long as each one matches what is stored.
+
+    A thin adapter: :func:`update_competency_criteria_group` makes every other refusal, including
+    the permission check, so an in-process caller is refused in the same cases. The body's fixed
+    fields are compared here, before that function runs, because only a REST body carries them.
+    """
+
+    serializer_class = CompetencyCriteriaGroupUpdateSerializer
+    http_method_names = ["patch"]
+    authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, tag_id: int, group_id: int):
+        """Check the body against the stored group, then delegate to the public API."""
+        # Same 404 the create and tree endpoints give a tag that isn't a competency, ahead of the body checks.
+        resolve_competency_tag(tag_id)
+        # Scoped by tag_id, so addressing a group under a competency it doesn't belong to is a 404.
+        group = get_object_or_404(
+            CompetencyCriteriaGroup.objects.select_related("course"), pk=group_id, tag_id=tag_id,
+        )
+        serializer = self.get_serializer(group, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            group = update_competency_criteria_group(
+                group.id, logic_operator=serializer.validated_data["logic_operator"], user=request.user,
+            )
+        except DjangoValidationError as exc:
+            raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        except CompetencyCriteriaGroupArchivedError as exc:
+            raise CompetencyCriteriaConflict(str(exc)) from exc
+        return Response(CompetencyCriteriaGroupSerializer(group).data, status=status.HTTP_200_OK)
