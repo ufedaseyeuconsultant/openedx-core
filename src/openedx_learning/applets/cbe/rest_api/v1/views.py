@@ -150,12 +150,7 @@ class CompetencyCriterionDeleteView(generics.GenericAPIView):
 
 class CompetencyCriteriaGroupDeleteView(generics.GenericAPIView):
     """
-    DELETE-only. Remove a CompetencyCriteriaGroup subtree: hard-delete, or archive it if learner status exists.
-
-    Does not call self.check_object_permissions(): oel_tagging.can_tag_object is checked inline
-    with a manual ``has_perm()`` call against the subtree's course, the same pattern
-    CompetencyCriterionDeleteView uses. A root group is rejected with a 400 before that check,
-    since a root's subtree has no single course to check against.
+    DELETE-only. Hard-delete a CompetencyCriteriaGroup subtree, or archive it if learner status exists anywhere in it.
     """
 
     authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
@@ -165,9 +160,7 @@ class CompetencyCriteriaGroupDeleteView(generics.GenericAPIView):
         """
         Resolve the group scoped to both path segments, check permission, then delegate to the public API.
 
-        The lookup deliberately does not filter `archived=False`, so a repeat DELETE against an
-        already-archived subtree still resolves (200), and a mismatched tag_id or a nonexistent
-        group_id both 404 the same way, via this one get_object_or_404 call.
+        The lookup keeps archived groups, so a repeat DELETE on an archived subtree still returns 200.
         """
         group = get_object_or_404(
             CompetencyCriteriaGroup, pk=self.kwargs["group_id"], tag_id=self.kwargs["tag_id"],

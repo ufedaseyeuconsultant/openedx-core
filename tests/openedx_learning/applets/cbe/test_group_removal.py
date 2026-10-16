@@ -1,8 +1,10 @@
 """Tests for delete_competency_criteria_group(), which reuses _cascade_from_group() unchanged."""
 from datetime import datetime
+from unittest import mock
 
 import pytest
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError
 
 from openedx_catalog.models import CourseRun
 from openedx_learning.api import delete_competency_criteria_group, resolve_competency_criteria_group_course
@@ -317,7 +319,114 @@ def test_permission_course_is_the_parents_course_for_a_non_course_level_target(t
     assert resolve_competency_criteria_group_course(leaf) == course_run
 
 
+@pytest.mark.parametrize("depth", [2, 3])
+def test_permission_course_is_the_nearest_course_level_ancestors_course_at_any_depth(
+    tag: Tag, course_run: CourseRun, depth: int,
+) -> None:
+    """A target nested `depth` levels below its course-level group resolves to that group's course."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    group = CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root)
+    for _ in range(depth):
+        group = CompetencyCriteriaGroup.objects.create(tag=tag, parent=group)
+
+    assert resolve_competency_criteria_group_course(group) == course_run
+
+
+def test_permission_course_rejects_a_group_with_no_course_level_group_in_its_lineage(tag: Tag) -> None:
+    """A non-root group with no course anywhere above it is invalid data, rejected as a group_id error."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    middle = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    target = CompetencyCriteriaGroup.objects.create(tag=tag, parent=middle)
+
+    with pytest.raises(ValidationError) as exc_info:
+        resolve_competency_criteria_group_course(target)
+
+    assert "group_id" in exc_info.value.message_dict
+
+
 def test_does_not_exist_for_an_unknown_group_id() -> None:
     """A group_id with no matching row raises CompetencyCriteriaGroup.DoesNotExist."""
     with pytest.raises(CompetencyCriteriaGroup.DoesNotExist):
         delete_competency_criteria_group(999999999)
+
+
+# =================================================================================================
+# Falling back to archive when the hard delete is refused
+# =================================================================================================
+
+
+def _build_subtree_with_criteria(
+    competency_taxonomy: CompetencyTaxonomy, tag: Tag, course_run: CourseRun,
+    default_rule_profile: CompetencyRuleProfile,
+) -> tuple[CompetencyCriteriaGroup, CompetencyCriteriaGroup, CompetencyCriterion, CompetencyCriterion]:
+    """Build root > target (course-level) > child, with one criterion on the target and one on the child."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    target = CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root)
+    child = CompetencyCriteriaGroup.objects.create(tag=tag, parent=target)
+    object_tag_a = _make_object_tag(competency_taxonomy, tag, "obj-a")
+    object_tag_b = _make_object_tag(competency_taxonomy, tag, "obj-b")
+    target_criterion = _make_criterion(target, object_tag_a, default_rule_profile)
+    child_criterion = _make_criterion(child, object_tag_b, default_rule_profile)
+    return target, child, target_criterion, child_criterion
+
+
+def _assert_subtree_archived_and_intact(
+    target: CompetencyCriteriaGroup, child: CompetencyCriteriaGroup, *criteria: CompetencyCriterion,
+) -> None:
+    """Assert that every group and criterion still exists and is archived, and every ObjectTag survived."""
+    for group in (target, child):
+        group.refresh_from_db()
+        assert group.archived is True
+    for criterion in criteria:
+        criterion.refresh_from_db()
+        assert criterion.archived is True
+        assert ObjectTag.objects.filter(id=criterion.object_tag_id).exists()
+
+
+def test_status_committed_after_the_check_falls_back_to_archive(
+    user, *, competency_taxonomy: CompetencyTaxonomy, tag: Tag, course_run: CourseRun,
+    default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """
+    A status row that appears between the status check and the delete makes the PROTECT foreign
+    key refuse the delete; the attempt rolls back and the whole subtree is archived instead.
+    """
+    target, child, target_criterion, child_criterion = _build_subtree_with_criteria(
+        competency_taxonomy, tag, course_run, default_rule_profile,
+    )
+    real_delete = CompetencyCriteriaGroup.delete
+
+    def _delete_after_a_status_appears(self, *args, **kwargs):
+        StudentCompetencyCriterionStatus.objects.create(
+            user=user, criterion=child_criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+        )
+        return real_delete(self, *args, **kwargs)
+
+    with mock.patch.object(
+        CompetencyCriteriaGroup, "delete", autospec=True, side_effect=_delete_after_a_status_appears,
+    ):
+        result = delete_competency_criteria_group(target.id)
+
+    assert result.id == target.id
+    assert result.archived is True
+    assert result.cascaded_group_count == 1
+    assert result.cascaded_criteria_count == 2
+    _assert_subtree_archived_and_intact(target, child, target_criterion, child_criterion)
+
+
+def test_integrity_error_on_the_delete_falls_back_to_archive(
+    competency_taxonomy: CompetencyTaxonomy, tag: Tag, course_run: CourseRun,
+    default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """A backend that reports the PROTECT violation as an IntegrityError gets the same archive fallback."""
+    target, child, target_criterion, child_criterion = _build_subtree_with_criteria(
+        competency_taxonomy, tag, course_run, default_rule_profile,
+    )
+
+    with mock.patch.object(CompetencyCriteriaGroup, "delete", autospec=True, side_effect=IntegrityError):
+        result = delete_competency_criteria_group(target.id)
+
+    assert result.archived is True
+    assert result.cascaded_group_count == 1
+    assert result.cascaded_criteria_count == 2
+    _assert_subtree_archived_and_intact(target, child, target_criterion, child_criterion)
