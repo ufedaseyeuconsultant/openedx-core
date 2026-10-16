@@ -1173,3 +1173,40 @@ def test_group_root_target_is_400_before_any_permission_check_or_write(
     assert set(
         CompetencyCriteriaGroup.objects.filter(archived=False).values_list("id", flat=True)
     ) == {root.id, course_level.id, leaf.id}
+
+
+@pytest.mark.parametrize("depth", [2, 3])
+def test_group_delete_checks_permission_against_the_course_level_ancestor_at_any_depth(
+    user_client: APIClient, tag: Tag, course_run: CourseRun, checked_object_ids: list[str], depth: int,
+) -> None:
+    """A target nested `depth` levels below its course-level group is checked against that course and deleted."""
+    course_level = _create_leaf_group(tag, course_run).parent
+    assert course_level is not None
+    target = course_level
+    for _ in range(depth):
+        target = CompetencyCriteriaGroup.objects.create(tag=tag, parent=target)
+
+    response = user_client.delete(group_delete_url(tag.id, target.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data["archived"] is False
+    assert checked_object_ids == [str(course_run.course_key)]
+    assert not CompetencyCriteriaGroup.objects.filter(id=target.id).exists()
+
+
+def test_group_with_no_course_level_group_in_its_lineage_is_400_before_any_permission_check_or_write(
+    user_client: APIClient, tag: Tag, checked_object_ids: list[str],
+) -> None:
+    """A non-root group with no course above it is invalid data: a 400, with no permission check and no write."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    middle = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    target = CompetencyCriteriaGroup.objects.create(tag=tag, parent=middle)
+
+    response = user_client.delete(group_delete_url(tag.id, target.id))
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "group_id" in response.data
+    assert not checked_object_ids
+    assert set(
+        CompetencyCriteriaGroup.objects.filter(archived=False).values_list("id", flat=True)
+    ) == {root.id, middle.id, target.id}
