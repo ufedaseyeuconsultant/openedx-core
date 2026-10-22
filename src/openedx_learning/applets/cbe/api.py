@@ -41,9 +41,11 @@ __all__ = [
     "create_competency_criterion",
     "create_competency_taxonomy",
     "delete_competency_criterion",
+    "delete_competency_criteria_group",
     "get_competency_rule_profiles",
     "is_competency_taxonomy",
     "record_graded_object_statuses",
+    "resolve_competency_criteria_group_course",
     "resolve_competency_tag",
     "resolve_supplied_leaf_group",
     "select_competency_taxonomies",
@@ -570,3 +572,170 @@ def delete_competency_criterion(criterion_id: int) -> CriterionDeletionResult:
     # the retry's cascade now sees it and archives only that ancestor; any other failure repeats
     # and propagates.
     return _remove_competency_criterion(criterion_id)
+
+
+@dataclass(frozen=True)
+class GroupDeletionResult:
+    """The outcome of :func:`delete_competency_criteria_group`, scoped to the target subtree only."""
+
+    id: int
+    archived: bool
+    cascaded_group_count: int
+    cascaded_criteria_count: int
+
+
+def resolve_competency_criteria_group_course(group: CompetencyCriteriaGroup) -> CourseRun:
+    """
+    Return the CourseRun that scopes the subtree rooted at ``group``.
+
+    UNSTABLE: the criteria-authoring family is incomplete, so its validation and group update
+    and archive behavior may change this function's shape without a deprecation cycle.
+
+    That is the course of the nearest group with one, starting at ``group`` itself and walking
+    up through its ancestors, so a group may sit at any depth below its course-level group. Costs
+    one query per ancestor walked. A caller checks ``oel_tagging.can_tag_object`` against this
+    course before removing the subtree.
+
+    Raises ValidationError (keyed "group_id") if ``group`` is a root CompetencyCriteriaGroup,
+    whose subtree can span several courses, or if no group in its lineage has a course.
+    """
+    if group.parent_id is None:
+        raise ValidationError({"group_id": _("group_id must not reference a root CompetencyCriteriaGroup.")})
+
+    node: CompetencyCriteriaGroup | None = group
+    while node is not None:
+        if node.course is not None:
+            return node.course
+        node = node.parent
+    raise ValidationError(
+        {"group_id": _("group_id must reference a group under a course-level CompetencyCriteriaGroup.")}
+    )
+
+
+def _lock_competency_criteria_subtree(
+    group_id: int,
+) -> tuple[CompetencyCriteriaGroup, set[int], list[CompetencyCriterion]]:
+    """
+    Lock and return the group ``group_id``, the ids of its whole subtree, and the criteria in it.
+
+    Rejects a root or course-less target before anything is locked beyond the target itself. Must
+    run inside a transaction.
+    """
+    target_group = CompetencyCriteriaGroup.objects.select_for_update().get(pk=group_id)
+    resolve_competency_criteria_group_course(target_group)
+
+    all_group_ids = {target_group.id}
+    level_ids = [target_group.id]
+    while level_ids:
+        level_ids = list(
+            CompetencyCriteriaGroup.objects.select_for_update()
+            .filter(parent_id__in=level_ids)
+            .values_list("id", flat=True)
+        )
+        all_group_ids.update(level_ids)
+
+    criteria = list(CompetencyCriterion.objects.select_for_update().filter(group_id__in=all_group_ids))
+    return target_group, all_group_ids, criteria
+
+
+def _archive_competency_criteria_subtree(
+    target_group: CompetencyCriteriaGroup, all_group_ids: set[int], criteria: list[CompetencyCriterion],
+) -> None:
+    """Archive every group and criterion in the subtree, then cascade the archive above the target."""
+    # Saves each row individually rather than with .update(), which would skip simple_history.
+    # Never touches any ObjectTag.
+    for group in CompetencyCriteriaGroup.objects.filter(id__in=all_group_ids):
+        group.archived = True
+        group.save()
+    for criterion in criteria:
+        criterion.archived = True
+        criterion.save()
+    if target_group.parent is not None:
+        _cascade_from_group(target_group.parent, "archive")
+
+
+def _subtree_has_status(all_group_ids: set[int], criterion_ids: list[int]) -> bool:
+    """Return whether a learner status row references any group in ``all_group_ids`` or any of ``criterion_ids``."""
+    return (
+        StudentCompetencyCriteriaGroupStatus.objects.filter(group_id__in=all_group_ids).exists()
+        or StudentCompetencyCriterionStatus.objects.filter(criterion_id__in=criterion_ids).exists()
+    )
+
+
+def _remove_competency_criteria_group(group_id: int) -> GroupDeletionResult:
+    """Run one all-or-nothing attempt to hard-delete or archive the subtree rooted at ``group_id``."""
+    with transaction.atomic():
+        # The locks make a concurrent status insert for any locked row wait for this transaction,
+        # since inserting a row that references a locked row blocks on MySQL and PostgreSQL.
+        target_group, all_group_ids, criteria = _lock_competency_criteria_subtree(group_id)
+        criterion_ids = [criterion.id for criterion in criteria]
+        has_status = _subtree_has_status(all_group_ids, criterion_ids)
+        if has_status:
+            _archive_competency_criteria_subtree(target_group, all_group_ids, criteria)
+        else:
+            parent_group = target_group.parent
+            tag = target_group.tag
+            object_tag_ids = {criterion.object_tag_id for criterion in criteria}
+            target_group.delete()
+            for object_tag_id in object_tag_ids:
+                if not CompetencyCriterion.objects.filter(object_tag_id=object_tag_id).exists():
+                    object_tag = ObjectTag.objects.get(id=object_tag_id)
+                    existing_values = [
+                        t.value for t in get_object_tags(object_tag.object_id, taxonomy_id=tag.taxonomy_id)
+                        if t.value != tag.value
+                    ]
+                    tag_object(object_tag.object_id, tag.taxonomy, existing_values)
+            if parent_group is not None:
+                _cascade_from_group(parent_group, "delete")
+        return GroupDeletionResult(
+            id=group_id,
+            archived=has_status,
+            cascaded_group_count=len(all_group_ids) - 1,
+            cascaded_criteria_count=len(criteria),
+        )
+
+
+def delete_competency_criteria_group(group_id: int) -> GroupDeletionResult:
+    """
+    Hard-delete the CompetencyCriteriaGroup subtree rooted at `group_id`, or archive it whole.
+
+    UNSTABLE: the criteria-authoring family is incomplete, so its validation and group update
+    and archive behavior may change this function's shape without a deprecation cycle.
+
+    The caller is expected to have already checked ``oel_tagging.can_tag_object`` against the
+    course :func:`resolve_competency_criteria_group_course` returns for the target group.
+
+    The subtree is the target group plus every descendant group and leaf CompetencyCriterion.
+    Hard-deleted if no learner status exists anywhere in it; archived in place, all-or-nothing,
+    if any does. Either way, :func:`_cascade_from_group` then runs above the target's own parent.
+
+    If the hard delete is refused, the attempt rolls back and the subtree is archived only if a
+    learner status row references a group or criterion in it, so the result reports archived=True.
+    Otherwise the refusal came from elsewhere, such as an ancestor group that gained a status after
+    the cascade checked it, so the delete is retried once. A failure on the retry propagates to the
+    caller.
+
+    Raises CompetencyCriteriaGroup.DoesNotExist if no such group exists, ValidationError
+    (keyed "group_id") if `group_id` names a root CompetencyCriteriaGroup or a group with no
+    course-level group in its lineage, and ProtectedError or IntegrityError if the retry is
+    refused too.
+    """
+    try:
+        return _remove_competency_criteria_group(group_id)
+    except (ProtectedError, IntegrityError):
+        # The refusal may come from the subtree, an ancestor group, or the tag cleanup. Only a
+        # status inside the subtree justifies archiving it.
+        with transaction.atomic():
+            target_group, all_group_ids, criteria = _lock_competency_criteria_subtree(group_id)
+            if _subtree_has_status(all_group_ids, [criterion.id for criterion in criteria]):
+                _archive_competency_criteria_subtree(target_group, all_group_ids, criteria)
+                return GroupDeletionResult(
+                    id=group_id,
+                    archived=True,
+                    cascaded_group_count=len(all_group_ids) - 1,
+                    cascaded_criteria_count=len(criteria),
+                )
+    # No status in the subtree. If the refusal came from an ancestor status committed meanwhile,
+    # the retry's cascade now sees it and archives only that ancestor; any other failure repeats
+    # and propagates.
+    return _remove_competency_criteria_group(group_id)
