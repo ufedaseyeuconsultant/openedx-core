@@ -654,6 +654,47 @@ def _archive_competency_criteria_subtree(
         _cascade_from_group(target_group.parent, "archive")
 
 
+def _subtree_has_status(all_group_ids: set[int], criterion_ids: list[int]) -> bool:
+    """Return whether a learner status row references any group in ``all_group_ids`` or any of ``criterion_ids``."""
+    return (
+        StudentCompetencyCriteriaGroupStatus.objects.filter(group_id__in=all_group_ids).exists()
+        or StudentCompetencyCriterionStatus.objects.filter(criterion_id__in=criterion_ids).exists()
+    )
+
+
+def _remove_competency_criteria_group(group_id: int) -> GroupDeletionResult:
+    """Run one all-or-nothing attempt to hard-delete or archive the subtree rooted at ``group_id``."""
+    with transaction.atomic():
+        # The locks make a concurrent status insert for any locked row wait for this transaction,
+        # since inserting a row that references a locked row blocks on MySQL and PostgreSQL.
+        target_group, all_group_ids, criteria = _lock_competency_criteria_subtree(group_id)
+        criterion_ids = [criterion.id for criterion in criteria]
+        has_status = _subtree_has_status(all_group_ids, criterion_ids)
+        if has_status:
+            _archive_competency_criteria_subtree(target_group, all_group_ids, criteria)
+        else:
+            parent_group = target_group.parent
+            tag = target_group.tag
+            object_tag_ids = {criterion.object_tag_id for criterion in criteria}
+            target_group.delete()
+            for object_tag_id in object_tag_ids:
+                if not CompetencyCriterion.objects.filter(object_tag_id=object_tag_id).exists():
+                    object_tag = ObjectTag.objects.get(id=object_tag_id)
+                    existing_values = [
+                        t.value for t in get_object_tags(object_tag.object_id, taxonomy_id=tag.taxonomy_id)
+                        if t.value != tag.value
+                    ]
+                    tag_object(object_tag.object_id, tag.taxonomy, existing_values)
+            if parent_group is not None:
+                _cascade_from_group(parent_group, "delete")
+        return GroupDeletionResult(
+            id=group_id,
+            archived=has_status,
+            cascaded_group_count=len(all_group_ids) - 1,
+            cascaded_criteria_count=len(criteria),
+        )
+
+
 def delete_competency_criteria_group(group_id: int) -> GroupDeletionResult:
     """
     Hard-delete the CompetencyCriteriaGroup subtree rooted at `group_id`, or archive it whole.
@@ -668,52 +709,33 @@ def delete_competency_criteria_group(group_id: int) -> GroupDeletionResult:
     Hard-deleted if no learner status exists anywhere in it; archived in place, all-or-nothing,
     if any does. Either way, :func:`_cascade_from_group` then runs above the target's own parent.
 
-    If the hard delete is refused because a learner status row appeared concurrently, the whole
-    attempt rolls back and the subtree is archived instead, so the result reports archived=True.
+    If the hard delete is refused, the attempt rolls back and the subtree is archived only if a
+    learner status row references a group or criterion in it, so the result reports archived=True.
+    Otherwise the refusal came from elsewhere, such as an ancestor group that gained a status after
+    the cascade checked it, so the delete is retried once. A failure on the retry propagates to the
+    caller.
 
-    Raises CompetencyCriteriaGroup.DoesNotExist if no such group exists, and ValidationError
+    Raises CompetencyCriteriaGroup.DoesNotExist if no such group exists, ValidationError
     (keyed "group_id") if `group_id` names a root CompetencyCriteriaGroup or a group with no
-    course-level group in its lineage.
+    course-level group in its lineage, and ProtectedError or IntegrityError if the retry is
+    refused too.
     """
     try:
-        with transaction.atomic():
-            # The locks make a concurrent status insert for any locked row wait for this transaction,
-            # since inserting a row that references a locked row blocks on MySQL and PostgreSQL.
-            target_group, all_group_ids, criteria = _lock_competency_criteria_subtree(group_id)
-            criterion_ids = [criterion.id for criterion in criteria]
-            has_status = (
-                StudentCompetencyCriteriaGroupStatus.objects.filter(group_id__in=all_group_ids).exists()
-                or StudentCompetencyCriterionStatus.objects.filter(criterion_id__in=criterion_ids).exists()
-            )
-            if has_status:
-                _archive_competency_criteria_subtree(target_group, all_group_ids, criteria)
-            else:
-                parent_group = target_group.parent
-                tag = target_group.tag
-                object_tag_ids = {criterion.object_tag_id for criterion in criteria}
-                target_group.delete()
-                for object_tag_id in object_tag_ids:
-                    if not CompetencyCriterion.objects.filter(object_tag_id=object_tag_id).exists():
-                        object_tag = ObjectTag.objects.get(id=object_tag_id)
-                        existing_values = [
-                            t.value for t in get_object_tags(object_tag.object_id, taxonomy_id=tag.taxonomy_id)
-                            if t.value != tag.value
-                        ]
-                        tag_object(object_tag.object_id, tag.taxonomy, existing_values)
-                if parent_group is not None:
-                    _cascade_from_group(parent_group, "delete")
+        return _remove_competency_criteria_group(group_id)
     except (ProtectedError, IntegrityError):
-        # The status foreign keys are on_delete=PROTECT: a status row in the subtree or on an
-        # ancestor group, committed after the check above, refuses the delete. The transaction has
-        # rolled back, so nothing was removed; archive the subtree as it stands now instead.
-        has_status = True
+        # The refusal may come from the subtree, an ancestor group, or the tag cleanup. Only a
+        # status inside the subtree justifies archiving it.
         with transaction.atomic():
             target_group, all_group_ids, criteria = _lock_competency_criteria_subtree(group_id)
-            _archive_competency_criteria_subtree(target_group, all_group_ids, criteria)
-
-    return GroupDeletionResult(
-        id=group_id,
-        archived=has_status,
-        cascaded_group_count=len(all_group_ids) - 1,
-        cascaded_criteria_count=len(criteria),
-    )
+            if _subtree_has_status(all_group_ids, [criterion.id for criterion in criteria]):
+                _archive_competency_criteria_subtree(target_group, all_group_ids, criteria)
+                return GroupDeletionResult(
+                    id=group_id,
+                    archived=True,
+                    cascaded_group_count=len(all_group_ids) - 1,
+                    cascaded_criteria_count=len(criteria),
+                )
+    # No status in the subtree. If the refusal came from an ancestor status committed meanwhile,
+    # the retry's cascade now sees it and archives only that ancestor; any other failure repeats
+    # and propagates.
+    return _remove_competency_criteria_group(group_id)

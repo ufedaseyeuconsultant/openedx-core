@@ -14,6 +14,7 @@ from openedx_learning.models import (
     CompetencyRuleProfile,
     CompetencyTaxonomy,
     MasteryStatus,
+    StudentCompetencyCriteriaGroupStatus,
     StudentCompetencyCriterionStatus,
 )
 from openedx_tagging.models import ObjectTag, Tag
@@ -383,28 +384,24 @@ def _assert_subtree_archived_and_intact(
         assert ObjectTag.objects.filter(id=criterion.object_tag_id).exists()
 
 
-def test_status_committed_after_the_check_falls_back_to_archive(
+def test_status_in_the_subtree_missed_by_the_first_check_archives_it(
     user, *, competency_taxonomy: CompetencyTaxonomy, tag: Tag, course_run: CourseRun,
     default_rule_profile: CompetencyRuleProfile, now: datetime,
 ) -> None:
     """
-    A status row that appears between the status check and the delete makes the PROTECT foreign
-    key refuse the delete; the attempt rolls back and the whole subtree is archived instead.
+    A criterion in the subtree has a status row, but the first status check misses it. The PROTECT
+    foreign key refuses the delete, the attempt rolls back, and the fallback finds the status and
+    archives the whole subtree, leaving every ObjectTag in place.
     """
     target, child, target_criterion, child_criterion = _build_subtree_with_criteria(
         competency_taxonomy, tag, course_run, default_rule_profile,
     )
-    real_delete = CompetencyCriteriaGroup.delete
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=child_criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
 
-    def _delete_after_a_status_appears(self, *args, **kwargs):
-        StudentCompetencyCriterionStatus.objects.create(
-            user=user, criterion=child_criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
-        )
-        return real_delete(self, *args, **kwargs)
-
-    with mock.patch.object(
-        CompetencyCriteriaGroup, "delete", autospec=True, side_effect=_delete_after_a_status_appears,
-    ):
+    # Call 1 is the check inside the transaction, call 2 is the fallback re-check.
+    with mock.patch("openedx_learning.applets.cbe.api._subtree_has_status", side_effect=[False, True]):
         result = delete_competency_criteria_group(target.id)
 
     assert result.id == target.id
@@ -414,19 +411,58 @@ def test_status_committed_after_the_check_falls_back_to_archive(
     _assert_subtree_archived_and_intact(target, child, target_criterion, child_criterion)
 
 
-def test_integrity_error_on_the_delete_falls_back_to_archive(
+def test_status_on_an_ancestor_missed_once_archives_only_the_ancestor(
+    user, *, competency_taxonomy: CompetencyTaxonomy, tag: Tag, course_run: CourseRun,
+    default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """
+    The target's parent has a status row, but the cascade's first check misses it, so deleting that
+    parent is refused. The subtree itself has no status, so the fallback does not archive it; the
+    retry sees the status, archives the parent and the root, and the target is still hard-deleted.
+    If the fallback archived unconditionally, the target and its criteria would survive and this
+    would fail.
+    """
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    course_level = CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root)
+    target = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_level)
+    object_tag = _make_object_tag(competency_taxonomy, tag, "obj-a")
+    criterion = _make_criterion(target, object_tag, default_rule_profile)
+    StudentCompetencyCriteriaGroupStatus.objects.create(
+        user=user, group=course_level, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    # Call 1 is the first cascade's check on the target's parent, call 2 is the retry's check on it.
+    with mock.patch("openedx_learning.applets.cbe.api._group_has_status", side_effect=[False, True]):
+        result = delete_competency_criteria_group(target.id)
+
+    assert result.archived is False
+    assert not CompetencyCriteriaGroup.objects.filter(id=target.id).exists()
+    assert not CompetencyCriterion.objects.filter(id=criterion.id).exists()
+    assert not ObjectTag.objects.filter(id=object_tag.id).exists()
+    course_level.refresh_from_db()
+    assert course_level.archived is True
+    root.refresh_from_db()
+    assert root.archived is True
+
+
+def test_unrelated_integrity_error_propagates_without_archiving(
     competency_taxonomy: CompetencyTaxonomy, tag: Tag, course_run: CourseRun,
     default_rule_profile: CompetencyRuleProfile,
 ) -> None:
-    """A backend that reports the PROTECT violation as an IntegrityError gets the same archive fallback."""
+    """
+    An IntegrityError from the object_tag cleanup, with no status anywhere, is retried once and then
+    propagates. The subtree is not archived.
+    """
     target, child, target_criterion, child_criterion = _build_subtree_with_criteria(
         competency_taxonomy, tag, course_run, default_rule_profile,
     )
 
-    with mock.patch.object(CompetencyCriteriaGroup, "delete", autospec=True, side_effect=IntegrityError):
-        result = delete_competency_criteria_group(target.id)
+    with mock.patch("openedx_learning.applets.cbe.api.tag_object", side_effect=IntegrityError) as tag_object:
+        with pytest.raises(IntegrityError):
+            delete_competency_criteria_group(target.id)
 
-    assert result.archived is True
-    assert result.cascaded_group_count == 1
-    assert result.cascaded_criteria_count == 2
-    _assert_subtree_archived_and_intact(target, child, target_criterion, child_criterion)
+    assert tag_object.call_count == 2
+
+    for row in (target, child, target_criterion, child_criterion):
+        row.refresh_from_db()
+        assert row.archived is False
