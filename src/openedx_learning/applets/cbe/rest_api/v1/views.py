@@ -26,6 +26,7 @@ from ...api import (
     bulk_update_competency_criteria,
     get_competency_criteria_tree,
     get_competency_rule_profiles,
+    parse_course_keys,
     resolve_competency_tag,
 )
 from ...models import CompetencyCriteriaGroup, CompetencyCriterion, CompetencyRuleProfile
@@ -33,6 +34,7 @@ from ..paginators import CompetencyRuleProfilePagination
 from .permissions import CompetencyReadPermission, CompetencyRuleProfilePermissions
 from .serializers import (
     CompetencyCriteriaGroupSerializer,
+    CompetencyCriteriaQueryParamsSerializer,
     CompetencyCriterionBulkUpdateSerializer,
     CompetencyCriterionReadSerializer,
     CompetencyCriterionSerializer,
@@ -193,8 +195,18 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
         except Tag.DoesNotExist as exc:
             raise NotFound(str(exc)) from exc
         self.check_object_permissions(request, tag)
-        tree = get_competency_criteria_tree(tag)
+        query_params = CompetencyCriteriaQueryParamsSerializer(data=request.query_params.dict())
+        query_params.is_valid(raise_exception=True)
+        course_keys = None
+        if "course_keys" in query_params.validated_data:
+            try:
+                course_keys = parse_course_keys(query_params.validated_data["course_keys"])
+            except DjangoValidationError as exc:
+                raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        tree = get_competency_criteria_tree(tag, course_keys)
         return Response({
             "groups": CompetencyCriteriaGroupSerializer(tree.groups, many=True).data,
             "criteria": CompetencyCriterionReadSerializer(tree.criteria, many=True).data,
+            "criteria_count": tree.criteria_count,
+            "total_criteria_count": tree.total_criteria_count,
         })
