@@ -1134,7 +1134,7 @@ def test_get_competency_criteria_tree_excludes_archived_rows_when_scoped_to_thei
         group=archived_leaf, object_tag=archived_object_tag, rule_profile=default_rule_profile, archived=True,
     )
 
-    tree = get_competency_criteria_tree(tag.id, [course_run.course_key])
+    tree = get_competency_criteria_tree(tag, [course_run.course_key])
 
     returned_group_ids = {group.id for group in tree.groups}
     returned_criterion_ids = {criterion.id for criterion in tree.criteria}
@@ -1335,15 +1335,16 @@ def test_get_competency_criteria_tree_costs_a_bounded_number_of_queries(
     tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile, django_assert_num_queries,
 ) -> None:
     """
-    Reading several groups and criteria costs a fixed three queries, not one per row.
+    Reading several groups and criteria costs two queries unscoped and three scoped, not one per row.
 
     Pins the select_related("course")/select_related("object_tag") calls in
     get_competency_criteria_tree(): dropping either would still pass every other test in this
     module (the rows returned would be identical), since select_related only changes how many
-    queries fetch them, not which rows come back. The third query is the always-run
-    total_criteria_count count, fixed regardless of how many groups/criteria exist.
+    queries fetch them, not which rows come back. The extra scoped query resolves the course
+    keys to course run ids.
     """
     leaf = _create_leaf_group(tag, course_run)
+    assert course_run.course_key is not None
     for i in range(3):
         object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, f"p{i}"), taxonomy=tag.taxonomy, tag=tag)
         CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
@@ -1354,6 +1355,22 @@ def test_get_competency_criteria_tree_costs_a_bounded_number_of_queries(
             _ = group.course  # accessing the select_related'd relation must not add a query
         for criterion in tree.criteria:
             _ = criterion.object_tag
+
+    with django_assert_num_queries(3):
+        tree = get_competency_criteria_tree(tag, [course_run.course_key])
+        for group in tree.groups:
+            _ = group.course
+        for criterion in tree.criteria:
+            _ = criterion.object_tag
+
+
+def test_get_competency_criteria_tree_costs_one_query_when_the_competency_has_no_groups(
+    tag: Tag, course_run: CourseRun, django_assert_num_queries,
+) -> None:
+    """A competency with no groups skips the criteria query and, when scoped, the course run lookup."""
+    assert course_run.course_key is not None
+    with django_assert_num_queries(1):
+        get_competency_criteria_tree(tag, [course_run.course_key])
 
 
 # ==============================================================================================
@@ -1375,8 +1392,8 @@ def test_get_competency_criteria_tree_course_keys_none_matches_unfiltered_behavi
     CompetencyCriterion.objects.create(group=leaf1, object_tag=object_tag1, rule_profile=default_rule_profile)
     CompetencyCriterion.objects.create(group=leaf2, object_tag=object_tag2, rule_profile=default_rule_profile)
 
-    unfiltered = get_competency_criteria_tree(tag.id)
-    explicit_none = get_competency_criteria_tree(tag.id, None)
+    unfiltered = get_competency_criteria_tree(tag)
+    explicit_none = get_competency_criteria_tree(tag, None)
 
     assert {g.id for g in explicit_none.groups} == {g.id for g in unfiltered.groups}
     assert {c.id for c in explicit_none.criteria} == {c.id for c in unfiltered.criteria}
@@ -1396,7 +1413,7 @@ def test_get_competency_criteria_tree_course_keys_empty_list_returns_only_the_ro
     object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
     CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
 
-    tree = get_competency_criteria_tree(tag.id, [])
+    tree = get_competency_criteria_tree(tag, [])
 
     assert {g.id for g in tree.groups} == {root.id}
     assert not tree.criteria
@@ -1425,7 +1442,7 @@ def test_get_competency_criteria_tree_course_keys_scoped_to_one_course(
     assert root is not None
     assert course_run.course_key is not None
 
-    tree = get_competency_criteria_tree(tag.id, [course_run.course_key])
+    tree = get_competency_criteria_tree(tag, [course_run.course_key])
 
     assert {g.id for g in tree.groups} == {root.id, course_level_a.id, leaf_a.id}
     assert [c.id for c in tree.criteria] == [criterion_a.id]
@@ -1457,13 +1474,13 @@ def test_get_competency_criteria_tree_course_keys_preserve_request_order(
     a_group_ids = {leaf_a.id, leaf_a.parent_id}
     b_group_ids = {leaf_b.id, leaf_b.parent_id}
 
-    tree_b_first = get_competency_criteria_tree(tag.id, [b_key, a_key])
+    tree_b_first = get_competency_criteria_tree(tag, [b_key, a_key])
     b_positions = [i for i, g in enumerate(tree_b_first.groups) if g.id in b_group_ids]
     a_positions = [i for i, g in enumerate(tree_b_first.groups) if g.id in a_group_ids]
     assert max(b_positions) < min(a_positions)
     assert [c.id for c in tree_b_first.criteria] == [criterion_b.id, criterion_a.id]
 
-    tree_a_first = get_competency_criteria_tree(tag.id, [a_key, b_key])
+    tree_a_first = get_competency_criteria_tree(tag, [a_key, b_key])
     a_positions2 = [i for i, g in enumerate(tree_a_first.groups) if g.id in a_group_ids]
     b_positions2 = [i for i, g in enumerate(tree_a_first.groups) if g.id in b_group_ids]
     assert max(a_positions2) < min(b_positions2)
@@ -1482,7 +1499,7 @@ def test_get_competency_criteria_tree_course_keys_duplicate_key_is_not_duplicate
     assert course_run.course_key is not None
     key = course_run.course_key
 
-    tree = get_competency_criteria_tree(tag.id, [key, key])
+    tree = get_competency_criteria_tree(tag, [key, key])
 
     assert len(tree.groups) == len({g.id for g in tree.groups})
     assert [c.id for c in tree.criteria] == [criterion.id]
@@ -1500,7 +1517,7 @@ def test_get_competency_criteria_tree_course_keys_unresolvable_key_is_silently_i
     assert root is not None
     unresolvable_key = CourseKey.from_string("course-v1:NoOrg+NoCourse+NoRun")
 
-    tree = get_competency_criteria_tree(tag.id, [unresolvable_key])
+    tree = get_competency_criteria_tree(tag, [unresolvable_key])
 
     assert {g.id for g in tree.groups} == {root.id}
     assert not tree.criteria
@@ -1526,21 +1543,20 @@ def test_get_competency_criteria_tree_course_keys_scoped_to_a_course_with_nothin
     CompetencyCriterion.objects.create(group=leaf_b, object_tag=object_tag_b, rule_profile=default_rule_profile)
     assert empty_course_run.course_key is not None
 
-    tree = get_competency_criteria_tree(tag.id, [empty_course_run.course_key])
+    tree = get_competency_criteria_tree(tag, [empty_course_run.course_key])
 
     assert not tree.criteria
     assert tree.criteria_count == 0
     assert tree.total_criteria_count == 2
 
 
-def test_get_competency_criteria_tree_ranks_a_leaf_by_its_own_course_even_when_the_parent_is_archived(
+def test_get_competency_criteria_tree_scoped_prunes_a_leaf_whose_course_level_parent_is_archived(
     tag: Tag, course_run: CourseRun, organization: Organization, default_rule_profile: CompetencyRuleProfile,
 ) -> None:
     """
-    A non-archived leaf under an archived course-level parent still ranks under its real
-    course. The scope filter matches such a leaf via its parent's course_id, but the parent
-    itself is excluded from `groups` (archived=False), so ranking must look its course_id up
-    directly rather than falling back to "unscoped".
+    A non-archived leaf under an archived course-level parent is absent, even when its own course is
+    requested: the tree never returns a row whose ancestor is archived. Its criterion is also left
+    out of both counts.
     """
     other_course_run = make_course_run(organization, "Python200", "Fall2026")
     leaf_archived_parent = _create_leaf_group(tag, course_run)
@@ -1555,7 +1571,7 @@ def test_get_competency_criteria_tree_ranks_a_leaf_by_its_own_course_even_when_t
     object_tag_other = ObjectTag.objects.create(
         object_id=usage_key(other_course_run, "p1"), taxonomy=tag.taxonomy, tag=tag,
     )
-    criterion_archived_parent = CompetencyCriterion.objects.create(
+    CompetencyCriterion.objects.create(
         group=leaf_archived_parent, object_tag=object_tag_archived_parent, rule_profile=default_rule_profile,
     )
     criterion_other = CompetencyCriterion.objects.create(
@@ -1564,18 +1580,75 @@ def test_get_competency_criteria_tree_ranks_a_leaf_by_its_own_course_even_when_t
     assert course_run.course_key is not None
     assert other_course_run.course_key is not None
 
-    # other_course_run requested first, so a correct rank sorts criterion_other first. The
-    # bug this pins would rank the archived-parent leaf as unscoped (-1), always sorting it
-    # first regardless of request order -- wrong here, since its course was requested second.
-    tree = get_competency_criteria_tree(tag.id, [other_course_run.course_key, course_run.course_key])
+    tree = get_competency_criteria_tree(tag, [other_course_run.course_key, course_run.course_key])
 
-    assert [c.id for c in tree.criteria] == [criterion_other.id, criterion_archived_parent.id]
+    assert leaf_archived_parent.id not in {g.id for g in tree.groups}
+    assert [c.id for c in tree.criteria] == [criterion_other.id]
+    assert tree.criteria_count == 1
+    assert tree.total_criteria_count == 1
+
+
+def test_get_competency_criteria_tree_scopes_a_branch_three_levels_below_its_course(
+    tag: Tag, course_run: CourseRun, organization: Organization, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    A group nested below the leaf level inherits the course of the first course-bearing group on
+    its path from the root, so scoping to that course keeps it and scoping to another course drops it.
+    """
+    other_course_run = make_course_run(organization, "Python200", "Fall2026")
+    leaf = _create_leaf_group(tag, course_run)
+    deep_group = CompetencyCriteriaGroup.objects.create(tag=tag, parent=leaf)
+    deeper_group = CompetencyCriteriaGroup.objects.create(tag=tag, parent=deep_group)
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+    criterion = CompetencyCriterion.objects.create(
+        group=deeper_group, object_tag=object_tag, rule_profile=default_rule_profile,
+    )
+    assert course_run.course_key is not None
+    assert other_course_run.course_key is not None
+
+    scoped = get_competency_criteria_tree(tag, [course_run.course_key])
+    other = get_competency_criteria_tree(tag, [other_course_run.course_key])
+
+    assert {deep_group.id, deeper_group.id} <= {g.id for g in scoped.groups}
+    assert [c.id for c in scoped.criteria] == [criterion.id]
+    assert not {deep_group.id, deeper_group.id} & {g.id for g in other.groups}
+    assert not other.criteria
+    assert other.total_criteria_count == 1
+
+
+def test_total_criteria_count_excludes_criteria_under_an_archived_ancestor(
+    tag: Tag, course_run: CourseRun, organization: Organization, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """total_criteria_count counts what the unscoped tree returns, leaving out criteria under an archived ancestor."""
+    other_course_run = make_course_run(organization, "Python200", "Fall2026")
+    live_leaf = _create_leaf_group(tag, course_run)
+    hidden_leaf = _create_leaf_group(tag, other_course_run)
+    hidden_course_level = hidden_leaf.parent
+    assert hidden_course_level is not None
+    hidden_course_level.archived = True
+    hidden_course_level.save()
+    live_object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "live"), taxonomy=tag.taxonomy, tag=tag)
+    hidden_object_tag = ObjectTag.objects.create(
+        object_id=usage_key(other_course_run, "hidden"), taxonomy=tag.taxonomy, tag=tag,
+    )
+    CompetencyCriterion.objects.create(group=live_leaf, object_tag=live_object_tag, rule_profile=default_rule_profile)
+    CompetencyCriterion.objects.create(
+        group=hidden_leaf, object_tag=hidden_object_tag, rule_profile=default_rule_profile,
+    )
+    assert course_run.course_key is not None
+
+    scoped = get_competency_criteria_tree(tag, [course_run.course_key])
+    empty_scope = get_competency_criteria_tree(tag, [])
+
+    assert scoped.total_criteria_count == 1
+    assert empty_scope.total_criteria_count == 1
+    assert empty_scope.criteria_count == 0
 
 
 def test_get_competency_criteria_tree_zero_criteria_anywhere(tag: Tag) -> None:
     """A competency with no criteria at all reports both counts as zero, with or without a course_keys scope."""
-    tree_unfiltered = get_competency_criteria_tree(tag.id)
-    tree_scoped = get_competency_criteria_tree(tag.id, [])
+    tree_unfiltered = get_competency_criteria_tree(tag)
+    tree_scoped = get_competency_criteria_tree(tag, [])
 
     assert tree_unfiltered.criteria_count == 0
     assert tree_unfiltered.total_criteria_count == 0
@@ -1607,7 +1680,7 @@ def test_get_competency_criteria_tree_a_different_tag_never_leaks_into_this_ones
     )
     CompetencyCriterion.objects.create(group=other_leaf, object_tag=other_object_tag, rule_profile=default_rule_profile)
 
-    tree = get_competency_criteria_tree(tag.id)
+    tree = get_competency_criteria_tree(tag)
 
     assert [c.id for c in tree.criteria] == [criterion.id]
     assert tree.criteria_count == 1
