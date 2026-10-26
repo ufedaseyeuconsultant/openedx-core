@@ -15,9 +15,9 @@ from django.db.models import F, Q, QuerySet
 from django.db.transaction import TransactionManagementError
 from django.utils.translation import gettext_lazy as _
 from opaque_keys import InvalidKeyError
-from opaque_keys.edx.keys import UsageKey
+from opaque_keys.edx.keys import CourseKey, UsageKey
 
-from openedx_catalog.api import get_course_run
+from openedx_catalog.api import get_course_run, get_course_run_ids
 from openedx_catalog.models_api import CourseRun
 from openedx_tagging.api import create_taxonomy, get_ancestor_tags, get_descendant_tags, get_object_tags, tag_object
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
@@ -49,6 +49,7 @@ __all__ = [
     "get_competency_rule_profiles",
     "get_courses_with_relative_criteria",
     "is_competency_taxonomy",
+    "parse_course_keys",
     "record_graded_object_statuses",
     "resolve_competency_tag",
     "resolve_supplied_leaf_group",
@@ -57,6 +58,7 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+MAX_COURSE_KEYS = 100
 
 
 class CompetencyCriterionArchivedError(Exception):
@@ -173,7 +175,7 @@ class CompetencyCriteriaTree:
     criteria: list[CompetencyCriterion]
 
 
-def get_competency_criteria_tree(tag: Tag) -> CompetencyCriteriaTree:
+def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None = None) -> CompetencyCriteriaTree:
     """
     Return the non-archived CompetencyCriteriaGroup tree and CompetencyCriterion leaves for ``tag``.
 
@@ -184,6 +186,15 @@ def get_competency_criteria_tree(tag: Tag) -> CompetencyCriteriaTree:
 
     UNSTABLE: the criteria-authoring family is incomplete, so its group update and archive
     behavior may change this function's shape without a deprecation cycle.
+
+    `course_keys=None` (the default) returns everything, unfiltered. `course_keys=[]` returns
+    only the instance-wide subtree (the root). A non-empty list adds the complete subtree for
+    each named course run, in the order given; an unresolvable or duplicate key is dropped or
+    collapsed to its first occurrence, never an error.
+
+    `criteria_count` is `len(criteria)`. `total_criteria_count` is the same count unfiltered
+    by `course_keys`, so a caller scoped down to zero results can still tell the competency
+    isn't actually empty.
     """
     groups = list(
         CompetencyCriteriaGroup.objects.filter(tag=tag, archived=False)
@@ -214,6 +225,31 @@ def get_competency_criteria_tree(tag: Tag) -> CompetencyCriteriaTree:
         groups=[group for group in groups if group.id in kept_group_ids],
         criteria=criteria,
     )
+
+
+def parse_course_keys(raw: str) -> list[CourseKey]:
+    """
+    Parse a comma-separated course_keys query parameter into a deduplicated list of CourseKey.
+
+    Stray separators (trailing, doubled, or all-commas) are ignored, not rejected. Raises
+    ValidationError if more than MAX_COURSE_KEYS entries remain after splitting -- checked
+    before dedup, so repeating a key can't dodge the cap -- or if any entry isn't a valid key.
+    """
+    entries = [entry.strip() for entry in raw.split(",")]
+    entries = [entry for entry in entries if entry]
+    if len(entries) > MAX_COURSE_KEYS:
+        raise ValidationError(
+            {"course_keys": _("No more than %(max)s course_keys may be requested at once.") % {"max": MAX_COURSE_KEYS}}
+        )
+    parsed = []
+    for entry in entries:
+        try:
+            parsed.append(CourseKey.from_string(entry))
+        except InvalidKeyError as exc:
+            raise ValidationError(
+                {"course_keys": _("'%(entry)s' is not a valid course key.") % {"entry": entry}}
+            ) from exc
+    return list(dict.fromkeys(parsed))
 
 
 def _create_leaf_group(

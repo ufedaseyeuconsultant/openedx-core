@@ -173,6 +173,20 @@ class CompetencyCriteriaGroupUpdateSerializer(serializers.Serializer):  # pylint
         return attrs
 
 
+class CompetencyCriteriaQueryParamsSerializer(serializers.Serializer):
+    """Query params for the criteria-tree read endpoint."""
+
+    course_keys = serializers.CharField(required=False, allow_blank=True)
+
+    def create(self, validated_data):
+        """Not supported: this serializer only validates query parameters."""
+        raise NotImplementedError
+
+    def update(self, instance, validated_data):
+        """Not supported: this serializer only validates query parameters."""
+        raise NotImplementedError
+
+
 class CompetencyCriterionReadSerializer(serializers.ModelSerializer):
     """
     Read-only representation of a CompetencyCriterion, for the criteria-tree read endpoint.
