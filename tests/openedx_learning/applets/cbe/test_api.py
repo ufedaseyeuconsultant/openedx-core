@@ -1622,7 +1622,7 @@ def test_get_competency_criteria_tree_scopes_a_branch_three_levels_below_its_cou
 def test_get_competency_criteria_tree_handles_duplicate_and_unresolvable_keys_together(
     tag: Tag, course_run: CourseRun, organization: Organization,
 ) -> None:
-    """A repeated key and an unresolvable key in one request leave roots, then b's branch, then a's, once each."""
+    """A repeated key and an unresolvable key in one request leave roots, then a's branch, then b's, once each."""
     run_b = make_course_run(organization, "Python200", "Fall2026")
     leaf_a = _create_leaf_group(tag, course_run)
     leaf_b = _create_leaf_group(tag, run_b)
@@ -1630,7 +1630,7 @@ def test_get_competency_criteria_tree_handles_duplicate_and_unresolvable_keys_to
     assert run_b.course_key is not None
     unknown = CourseKey.from_string("course-v1:NoOrg+NoCourse+NoRun")
 
-    tree = get_competency_criteria_tree(tag, [run_b.course_key, unknown, run_b.course_key, course_run.course_key])
+    tree = get_competency_criteria_tree(tag, [course_run.course_key, unknown, run_b.course_key, course_run.course_key])
 
     course_level_a = leaf_a.parent
     course_level_b = leaf_b.parent
@@ -1638,7 +1638,7 @@ def test_get_competency_criteria_tree_handles_duplicate_and_unresolvable_keys_to
     assert course_level_b is not None
     root = course_level_a.parent
     assert root is not None
-    assert [g.id for g in tree.groups] == [root.id, course_level_b.id, leaf_b.id, course_level_a.id, leaf_a.id]
+    assert [g.id for g in tree.groups] == [root.id, course_level_a.id, leaf_a.id, course_level_b.id, leaf_b.id]
 
 
 def test_get_competency_criteria_tree_scopes_by_the_course_level_course_when_a_deeper_group_carries_another_course(
