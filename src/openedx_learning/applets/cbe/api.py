@@ -48,7 +48,6 @@ __all__ = [
     "get_competency_rule_profiles",
     "get_courses_with_relative_criteria",
     "is_competency_taxonomy",
-    "parse_course_keys",
     "record_graded_object_statuses",
     "resolve_competency_tag",
     "resolve_supplied_leaf_group",
@@ -56,7 +55,6 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
-MAX_COURSE_KEYS = 100
 
 
 class CompetencyCriterionArchivedError(Exception):
@@ -185,14 +183,15 @@ def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None =
     nested at any depth below a course-level group follows that group's course.
 
     - ``None`` (the default) returns every reachable group.
-    - A list returns the roots plus the groups belonging to the named course runs. ``[]``
-      returns only the roots.
+    - A list returns the groups above any course (every group with no course on its path from
+      the root, itself included) plus the groups belonging to the named course runs. ``[]``
+      returns only the groups above any course.
     - A key that matches no course run is dropped, and a repeated key counts once, at its
-      first position. A list in which no key resolves returns only the roots.
+      first position. A list in which no key resolves returns only the groups above any course.
 
-    Groups come back roots first, then the named courses in the order requested, and within each
-    of those by ``(parent_id, ordering, id)`` with root-level rows first. Criteria are ordered by
-    their group's position in ``groups``, then ``id``.
+    Groups come back with the groups above any course first, then the named courses in the order
+    requested, and within each of those by ``(parent_id, ordering, id)`` with root-level rows first.
+    Criteria are ordered by their group's position in ``groups``, then ``id``.
 
     ``criteria_count`` is ``len(criteria)``. ``total_criteria_count`` is the number of criteria
     under every reachable group before ``course_keys`` is applied, so a caller scoped down to
@@ -230,14 +229,15 @@ def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None =
             run_ids_by_key[key]: rank
             for rank, key in enumerate((key for key in dict.fromkeys(course_keys) if key in run_ids_by_key), start=1)
         }
-        # Roots rank 0 and a branch ranks by its course. A branch whose course was not requested is
-        # left out. sorted() is stable, so each rank keeps the query order.
+        # Groups above any course rank 0, so a scoped tree never orphans a child from its parent, and
+        # a branch ranks by its course. A branch whose course was not requested is left out.
+        # sorted() is stable, so each rank keeps the query order.
         ranked_groups = []
         for group in reachable_groups:
             group_course_id = branch_course_ids[group.id]
-            if group.parent_id is None:
+            if group_course_id is None:
                 ranked_groups.append((0, group))
-            elif group_course_id is not None and group_course_id in rank_by_run_id:
+            elif group_course_id in rank_by_run_id:
                 ranked_groups.append((rank_by_run_id[group_course_id], group))
         scoped_groups = [group for _, group in sorted(ranked_groups, key=lambda ranked: ranked[0])]
 
@@ -258,31 +258,6 @@ def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None =
         criteria_count=len(criteria),
         total_criteria_count=len(all_criteria),
     )
-
-
-def parse_course_keys(raw: str) -> list[CourseKey]:
-    """
-    Parse a comma-separated course_keys query parameter into a deduplicated list of CourseKey.
-
-    Stray separators (trailing, doubled, or all-commas) are ignored, not rejected. Raises
-    ValidationError if more than MAX_COURSE_KEYS entries remain after splitting -- checked
-    before dedup, so repeating a key can't dodge the cap -- or if any entry isn't a valid key.
-    """
-    entries = [entry.strip() for entry in raw.split(",")]
-    entries = [entry for entry in entries if entry]
-    if len(entries) > MAX_COURSE_KEYS:
-        raise ValidationError(
-            {"course_keys": _("No more than %(max)s course_keys may be requested at once.") % {"max": MAX_COURSE_KEYS}}
-        )
-    parsed = []
-    for entry in entries:
-        try:
-            parsed.append(CourseKey.from_string(entry))
-        except InvalidKeyError as exc:
-            raise ValidationError(
-                {"course_keys": _("'%(entry)s' is not a valid course key.") % {"entry": entry}}
-            ) from exc
-    return list(dict.fromkeys(parsed))
 
 
 def _create_leaf_group(

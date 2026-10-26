@@ -5,6 +5,7 @@ Fixtures live in this directory's conftest.py. Several scenarios here create rul
 directly rather than through a live call, because no create or archive endpoint exists yet.
 """
 from typing import Any, Generator
+from urllib.parse import urlencode
 
 import pytest
 import rules
@@ -1363,8 +1364,8 @@ def test_course_keys_scopes_and_orders_the_response_over_a_real_request(
 ) -> None:
     """
     A real GET request scoped to two of three course runs returns only those two courses'
-    groups and criteria, in the order requested, with nothing from the third course run --
-    proving the scoping and ordering behavior end to end (view, permission, serializers), not
+    groups and criteria, in the order requested, with nothing from the third course run. This
+    covers the scoping and ordering behavior end to end (view, permission, serializers), not
     just at the get_competency_criteria_tree() function level.
     """
     course_b = make_course_run(organization, "Python200", "Fall2026")
@@ -1453,20 +1454,51 @@ def test_course_keys_of_only_commas_behaves_like_an_empty_scope(
 
 
 def test_a_malformed_course_key_is_400(user_client: APIClient, tag: Tag) -> None:
-    """An entry in course_keys that isn't a valid course key 400s."""
+    """An entry in course_keys that isn't a valid course key 400s, with the error keyed by course_keys."""
     response = user_client.get(criteria_tree_url(tag.id), {"course_keys": "not-a-course-key"})
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert set(response.data) == {"course_keys"}
 
 
 def test_more_than_the_limit_of_course_keys_is_400(user_client: APIClient, tag: Tag) -> None:
-    """More than 100 course_keys entries 400s, and the error names the 100 limit."""
+    """More than 100 course_keys entries 400s, keyed by course_keys, and the error names the 100 limit."""
     too_many = ",".join(f"course-v1:Org+Course{i}+Run" for i in range(101))
 
     response = user_client.get(criteria_tree_url(tag.id), {"course_keys": too_many})
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert set(response.data) == {"course_keys"}
     assert "100" in str(response.data)
+
+
+def test_exactly_the_limit_of_course_keys_is_200(user_client: APIClient, tag: Tag) -> None:
+    """Exactly 100 distinct, well-formed course_keys entries is accepted."""
+    at_limit = ",".join(f"course-v1:Org+Course{i}+Run" for i in range(100))
+
+    response = user_client.get(criteria_tree_url(tag.id), {"course_keys": at_limit})
+
+    assert response.status_code == status.HTTP_200_OK
+
+
+def test_repeating_one_course_key_past_the_limit_is_400(user_client: APIClient, tag: Tag) -> None:
+    """101 copies of one key 400s: the cap counts entries before duplicates are removed."""
+    repeated = ",".join(["course-v1:Org+Course+Run"] * 101)
+
+    response = user_client.get(criteria_tree_url(tag.id), {"course_keys": repeated})
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert set(response.data) == {"course_keys"}
+
+
+def test_a_repeated_course_keys_query_parameter_is_400(user_client: APIClient, tag: Tag) -> None:
+    """Supplying course_keys twice 400s, keyed by course_keys, instead of silently using the last value."""
+    query = urlencode({"course_keys": ["course-v1:Org+A+Run", "course-v1:Org+B+Run"]}, doseq=True)
+
+    response = user_client.get(f"{criteria_tree_url(tag.id)}?{query}")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert set(response.data) == {"course_keys"}
 
 
 def test_no_view_access_with_course_keys_still_403s_without_leaking_data(
