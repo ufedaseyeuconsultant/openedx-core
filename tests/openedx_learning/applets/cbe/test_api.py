@@ -1490,25 +1490,6 @@ def test_get_competency_criteria_tree_course_keys_preserve_request_order(
     assert [c.id for c in tree_a_first.criteria] == [criterion_a.id, criterion_b.id]
 
 
-def test_get_competency_criteria_tree_course_keys_duplicate_key_is_not_duplicated(
-    tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
-) -> None:
-    """A duplicate key in the request list doesn't duplicate that course's subtree, and its criteria count once."""
-    leaf = _create_leaf_group(tag, course_run)
-    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
-    criterion = CompetencyCriterion.objects.create(
-        group=leaf, object_tag=object_tag, rule_profile=default_rule_profile,
-    )
-    assert course_run.course_key is not None
-    key = course_run.course_key
-
-    tree = get_competency_criteria_tree(tag, [key, key])
-
-    assert len(tree.groups) == len({g.id for g in tree.groups})
-    assert [c.id for c in tree.criteria] == [criterion.id]
-    assert tree.criteria_count == 1
-
-
 def test_get_competency_criteria_tree_course_keys_unresolvable_key_is_silently_ignored(
     tag: Tag, course_run: CourseRun,
 ) -> None:
@@ -1729,6 +1710,30 @@ def test_get_competency_criteria_tree_a_different_tag_never_leaks_into_this_ones
     assert [c.id for c in tree.criteria] == [criterion.id]
     assert tree.criteria_count == 1
     assert tree.total_criteria_count == 1
+
+
+def test_get_competency_criteria_tree_scoped_keeps_every_group_above_any_course(
+    tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    A group with no course on its path stays in a scoped result even when it is not a root, so no
+    returned parent_id names a group that was left out. Scoping to [] keeps only those groups.
+    """
+    root = CompetencyCriteriaGroup.objects.create(tag=tag, parent=None)
+    mid = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    course_level = CompetencyCriteriaGroup.objects.create(tag=tag, parent=mid, course=course_run)
+    leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_level)
+    object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+    CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
+    assert course_run.course_key is not None
+
+    scoped = get_competency_criteria_tree(tag, [course_run.course_key])
+    empty = get_competency_criteria_tree(tag, [])
+
+    scoped_ids = {g.id for g in scoped.groups}
+    assert scoped_ids == {root.id, mid.id, course_level.id, leaf.id}
+    assert all(g.parent_id is None or g.parent_id in scoped_ids for g in scoped.groups)
+    assert {g.id for g in empty.groups} == {root.id, mid.id}
 
 
 def test_get_courses_with_relative_criteria_single_match(

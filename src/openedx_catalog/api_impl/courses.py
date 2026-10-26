@@ -122,6 +122,8 @@ def get_course_run_ids(course_keys: Iterable[CourseKey]) -> dict[CourseKey, int]
     """
     Return a {course_key: CourseRun.id} mapping for the entries that resolve to a real
     CourseRun. An unmatched key is simply absent from the result.
+
+    ⚠️ Does not check permissions or visibility rules.
     """
     course_keys = list(course_keys)
     if not course_keys:

@@ -206,6 +206,22 @@ def test_get_course_run_ids_duplicate_key_yields_one_entry(python100_summer26: C
     assert result == {key: python100_summer26.id}
 
 
+def test_get_course_run_ids_maps_found_keys_and_omits_the_unknown_one(
+    python100_summer26: CourseRun, python100_winter26: CourseRun,
+) -> None:
+    """With two keys that resolve and one that does not, the result maps exactly the two found keys to their ids."""
+    assert python100_summer26.course_key is not None
+    assert python100_winter26.course_key is not None
+    unknown_key = CourseKey.from_string("course-v1:NoOrg+NoCourse+NoRun")
+
+    result = api.get_course_run_ids([python100_summer26.course_key, unknown_key, python100_winter26.course_key])
+
+    assert result == {
+        python100_summer26.course_key: python100_summer26.id,
+        python100_winter26.course_key: python100_winter26.id,
+    }
+
+
 # sync_course_run_details
 
 

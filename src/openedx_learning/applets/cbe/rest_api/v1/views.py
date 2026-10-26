@@ -28,7 +28,6 @@ from ...api import (
     bulk_update_competency_criteria,
     get_competency_criteria_tree,
     get_competency_rule_profiles,
-    parse_course_keys,
     resolve_competency_tag,
     update_competency_criteria_group,
 )
@@ -191,9 +190,10 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
     The optional ``course_keys`` query parameter (comma-separated course keys) scopes the tree by
     course run. A group belongs to the course of the first group with a course set on the path
     from its root down to it, so every group below a course-level group follows that course.
-    Omitting the parameter returns every reachable group. Supplying it returns the root groups
-    plus the groups of the named runs, ordered roots first and then by the order requested; keys
-    that match no run are ignored, and an empty value returns only the roots.
+    Omitting the parameter returns every reachable group. Supplying it returns the groups above
+    any course plus the groups of the named runs, ordered with the groups above any course first
+    and then by the order requested; keys that match no run are ignored, and an empty value
+    returns only the groups above any course. The parameter may be supplied once.
 
     ``criteria_count`` is the number of criteria returned. ``total_criteria_count`` is the number
     under every reachable group regardless of ``course_keys``, so a client scoped down to zero
@@ -210,14 +210,11 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
         except Tag.DoesNotExist as exc:
             raise NotFound(str(exc)) from exc
         self.check_object_permissions(request, tag)
+        if len(request.query_params.getlist("course_keys")) > 1:
+            raise DRFValidationError({"course_keys": _("Supply course_keys once, as a comma-separated list.")})
         query_params = CompetencyCriteriaQueryParamsSerializer(data=request.query_params.dict())
         query_params.is_valid(raise_exception=True)
-        course_keys = None
-        if "course_keys" in query_params.validated_data:
-            try:
-                course_keys = parse_course_keys(query_params.validated_data["course_keys"])
-            except DjangoValidationError as exc:
-                raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        course_keys = query_params.validated_data.get("course_keys")
         tree = get_competency_criteria_tree(tag, course_keys)
         return Response({
             "groups": CompetencyCriteriaGroupSerializer(tree.groups, many=True).data,
