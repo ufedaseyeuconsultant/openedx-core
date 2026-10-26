@@ -187,6 +187,17 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
     for client-side reconstruction: each group carries its parent_id, and each criterion its
     group_id. An empty tree (the tag exists but nothing has been authored under it yet) is a
     valid 200 with two empty arrays; a 404 is reserved for tag resolution failure only.
+
+    The optional ``course_keys`` query parameter (comma-separated course keys) scopes the tree by
+    course run. A group belongs to the course of the first group with a course set on the path
+    from its root down to it, so every group below a course-level group follows that course.
+    Omitting the parameter returns every reachable group. Supplying it returns the root groups
+    plus the groups of the named runs, ordered roots first and then by the order requested; keys
+    that match no run are ignored, and an empty value returns only the roots.
+
+    ``criteria_count`` is the number of criteria returned. ``total_criteria_count`` is the number
+    under every reachable group regardless of ``course_keys``, so a client scoped down to zero
+    criteria can still tell the competency is not empty.
     """
 
     authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
