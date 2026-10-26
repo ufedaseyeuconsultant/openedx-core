@@ -1616,6 +1616,47 @@ def test_get_competency_criteria_tree_scopes_a_branch_three_levels_below_its_cou
     assert other.total_criteria_count == 1
 
 
+def test_get_competency_criteria_tree_handles_duplicate_and_unresolvable_keys_together(
+    tag: Tag, course_run: CourseRun, organization: Organization,
+) -> None:
+    """A repeated key and an unresolvable key in one request leave roots, then b's branch, then a's, once each."""
+    run_b = make_course_run(organization, "Python200", "Fall2026")
+    leaf_a = _create_leaf_group(tag, course_run)
+    leaf_b = _create_leaf_group(tag, run_b)
+    assert course_run.course_key is not None
+    assert run_b.course_key is not None
+    unknown = CourseKey.from_string("course-v1:NoOrg+NoCourse+NoRun")
+
+    tree = get_competency_criteria_tree(tag, [run_b.course_key, unknown, run_b.course_key, course_run.course_key])
+
+    course_level_a = leaf_a.parent
+    course_level_b = leaf_b.parent
+    assert course_level_a is not None
+    assert course_level_b is not None
+    root = course_level_a.parent
+    assert root is not None
+    assert [g.id for g in tree.groups] == [root.id, course_level_b.id, leaf_b.id, course_level_a.id, leaf_a.id]
+
+
+def test_get_competency_criteria_tree_scopes_by_the_course_level_course_when_a_deeper_group_carries_another_course(
+    tag: Tag, course_run: CourseRun, organization: Organization,
+) -> None:
+    """A group below course-level group X that carries course Y follows X: scoping to X keeps it, to Y drops it."""
+    run_y = make_course_run(organization, "Python200", "Fall2026")
+    leaf = _create_leaf_group(tag, course_run)
+    course_level = leaf.parent
+    assert course_level is not None
+    deeper = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_level, course=run_y)
+    assert course_run.course_key is not None
+    assert run_y.course_key is not None
+
+    scoped_to_x = get_competency_criteria_tree(tag, [course_run.course_key])
+    scoped_to_y = get_competency_criteria_tree(tag, [run_y.course_key])
+
+    assert deeper.id in {g.id for g in scoped_to_x.groups}
+    assert deeper.id not in {g.id for g in scoped_to_y.groups}
+
+
 def test_total_criteria_count_excludes_criteria_under_an_archived_ancestor(
     tag: Tag, course_run: CourseRun, organization: Organization, default_rule_profile: CompetencyRuleProfile,
 ) -> None:

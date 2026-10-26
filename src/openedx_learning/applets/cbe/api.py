@@ -230,21 +230,16 @@ def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None =
             run_ids_by_key[key]: rank
             for rank, key in enumerate((key for key in dict.fromkeys(course_keys) if key in run_ids_by_key), start=1)
         }
-        # Roots rank 0 and a branch ranks by its course; sorted() is stable, so each rank keeps the
-        # query order. A branch with no named course is dropped.
-        ranks: dict[int, int | None] = {}
+        # Roots rank 0 and a branch ranks by its course. A branch whose course was not requested is
+        # left out. sorted() is stable, so each rank keeps the query order.
+        ranked_groups = []
         for group in reachable_groups:
-            run_id = branch_course_ids[group.id]
+            group_course_id = branch_course_ids[group.id]
             if group.parent_id is None:
-                ranks[group.id] = 0
-            elif run_id is not None:
-                ranks[group.id] = rank_by_run_id.get(run_id)
-            else:
-                ranks[group.id] = None
-        scoped_groups = sorted(
-            (group for group in reachable_groups if ranks[group.id] is not None),
-            key=lambda group: ranks[group.id] or 0,
-        )
+                ranked_groups.append((0, group))
+            elif group_course_id is not None and group_course_id in rank_by_run_id:
+                ranked_groups.append((rank_by_run_id[group_course_id], group))
+        scoped_groups = [group for _, group in sorted(ranked_groups, key=lambda ranked: ranked[0])]
 
     all_criteria = list(
         CompetencyCriterion.objects.filter(group_id__in=branch_course_ids.keys(), archived=False)
