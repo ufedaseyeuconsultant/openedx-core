@@ -83,8 +83,8 @@ def criterion_delete_url(tag_id: int, criterion_id: int) -> str:
 
 
 def group_delete_url(tag_id: int, group_id: int) -> str:
-    """Return the delete-group endpoint's path for `tag_id`/`group_id`, resolved through the URL name."""
-    return reverse("cbe:group-delete", kwargs={"tag_id": tag_id, "group_id": group_id})
+    """Return the group detail endpoint's path for `tag_id`/`group_id`, which DELETE is sent to."""
+    return reverse("cbe:criteria-group-detail", kwargs={"tag_id": tag_id, "group_id": group_id})
 
 
 def usage_key(course_run: CourseRun, block_id: str) -> str:
@@ -1832,11 +1832,11 @@ def test_update_group_from_an_unidentified_caller_is_401(
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
 
 
-@pytest.mark.parametrize("method", ["get", "put", "post", "delete"])
-def test_group_detail_offers_only_patch(
+@pytest.mark.parametrize("method", ["get", "put", "post"])
+def test_group_detail_offers_only_patch_and_delete(
     method: str, user_client: APIClient, tag: Tag, leaf: CompetencyCriteriaGroup,
 ) -> None:
-    """Every method other than PATCH, PUT included, is refused as not allowed."""
+    """Every method other than PATCH and DELETE, PUT included, is refused as not allowed."""
     response = getattr(user_client, method)(group_detail_url(tag.id, leaf.id), {}, format="json")
 
     assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED
@@ -2017,7 +2017,7 @@ def test_delete_maps_a_validation_error_from_the_api_to_400(
 
 
 # ==============================================================================================
-# CompetencyCriteriaGroupDeleteView (#675)
+# CompetencyCriteriaGroupDetailView DELETE (#675)
 # ==============================================================================================
 
 
