@@ -188,8 +188,7 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
     valid 200 with two empty arrays; a 404 is reserved for tag resolution failure only.
 
     The optional ``course_keys`` query parameter (comma-separated course keys) scopes the tree by
-    course run. A group belongs to the course of the first group with a course set on the path
-    from its root down to it, so every group below a course-level group follows that course.
+    course run. A course run's groups are its course-level group and every group nested below it.
     Omitting the parameter returns every reachable group. Supplying it returns the groups above
     any course plus the groups of the named runs, ordered with the groups above any course first
     and then by the order requested; keys that match no run are ignored, and an empty value

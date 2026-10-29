@@ -189,14 +189,13 @@ def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None =
     criterion is returned only if it is non-archived and its group is returned, so the result
     always forms one tree: no returned ``parent_id`` or ``group_id`` names a row that was left out.
 
-    ``course_keys`` scopes the result by course run. A group belongs to the course of the first
-    group with ``course`` set on the path from its root down to it, itself included, so a group
-    nested at any depth below a course-level group follows that group's course.
+    ``course_keys`` scopes the result by course run. A course run's groups are its course-level
+    group (the group whose ``course`` is that run) and every group nested below it, at any depth.
+    The groups above any course are the ones not nested in any course-level group.
 
     - ``None`` (the default) returns every reachable group.
-    - A list returns the groups above any course (every group with no course on its path from
-      the root, itself included) plus the groups belonging to the named course runs. ``[]``
-      returns only the groups above any course.
+    - A list returns the groups above any course plus the groups of the named course runs.
+      ``[]`` returns only the groups above any course.
     - A key that matches no course run is dropped, and a repeated key counts once, at its
       first position. A list in which no key resolves returns only the groups above any course.
 

@@ -109,7 +109,7 @@ Decision
 
    - Empty groups: Persisted criteria definitions should not contain empty groups. Authoring flows may temporarily create empty groups while editing, but backend validation must reject them.
    - Mixed tree depths: Backend supports deeply nested groups. Current frontend authoring constraint is a maximum depth of 3 layers total, using zero-indexed depth (``0=root``, ``1=course-scope group``, ``2=leaf criteria/group``).
-   - Retrieval scope: A read always includes the root scope (all nodes where ``course_id is null``), plus any selected subset of course-scoped groups, each returned as a complete subtree, never truncated. A group's course scope is the first ``course`` on its path from the root, at any depth, so every group nested below a course-scoped group follows that group's course.
+   - Retrieval scope: A read always includes the root scope (all nodes where ``course_id is null``), plus any selected subset of course-scoped groups, each returned as a complete subtree, never truncated.
    - Practical size and growth: Total rows in ``CompetencyCriteriaGroup`` are expected to grow over time as course runs are added; this ADR sets no global DB row cap. No max total node-count cap is required per root group. For ``course_id is null`` branches, expected size is small (realistically <=500 nodes).
 
 
@@ -458,10 +458,3 @@ Changelog
 * ``scope_code`` on ``CompetencyRuleProfile`` is now computed by
   application code instead of being database-generated, and is set to null while a
   profile is archived, freeing its scope for a replacement.
-
-2026-09-30:
-
-* For issue #682: documented that the criteria-tree read scopes by course run. A group's
-  course is the first ``course`` on its path from the root, at any depth, so groups nested
-  below a course-scoped group follow that course. A scoped read keeps every group above any
-  course, plus the groups of the requested course runs, each as a complete subtree.
