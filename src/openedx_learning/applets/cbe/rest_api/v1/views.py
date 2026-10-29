@@ -26,6 +26,8 @@ from ...api import (
     CompetencyCriterionArchivedError,
     associate_competency_criterion,
     bulk_update_competency_criteria,
+    delete_or_archive_competency_criteria_group,
+    delete_or_archive_competency_criterion,
     get_competency_criteria_tree,
     get_competency_rule_profiles,
     resolve_competency_tag,
@@ -225,25 +227,33 @@ class CompetencyCriteriaTreeView(generics.GenericAPIView):
 
 class CompetencyCriteriaGroupDetailView(generics.GenericAPIView):
     """
-    PATCH-only. Change how one CompetencyCriteriaGroup combines the criteria and groups beneath it.
+    PATCH or DELETE one CompetencyCriteriaGroup.
 
-    **Example Request**
+    PATCH changes how the group combines the criteria and groups beneath it. DELETE hard-deletes
+    the group's subtree, or archives it if learner status exists anywhere in it.
+
+    **Example Requests**
         PATCH api/cbe/v1/competencies/<tag_id>/criteria-groups/<group_id>/
         ``{"logic_operator": "AND"}``
 
-    The response is the group as stored, in the criteria-tree endpoint's shape. ``logic_operator``
+        DELETE api/cbe/v1/competencies/<tag_id>/criteria-groups/<group_id>/
+
+    PATCH responds with the group as stored, in the criteria-tree endpoint's shape. ``logic_operator``
     is the only editable field. The body may also repeat any other field the group's representation
     carries, so a client can send back what it read, as long as each one matches what is stored.
 
-    A thin adapter: :func:`update_competency_criteria_group` makes every other refusal, including
-    the edit permission check, so an in-process caller is refused in the same cases. The body's
-    fixed fields are compared here, before that function runs, because only a REST body carries
-    them. Comparing them reveals what's stored, so a caller who can't read the competency's tree is
-    refused with 403 before the group is looked up.
+    For PATCH, the view is a thin adapter: :func:`update_competency_criteria_group` makes every other
+    refusal, including the edit permission check, so an in-process caller is refused in the same
+    cases. The body's fixed fields are compared here, before that function runs, because only a REST
+    body carries them. Comparing them reveals what's stored, so a caller who can't read the
+    competency's tree is refused with 403 before the group is looked up.
+
+    DELETE only resolves the group from the URL. Course resolution and the permission check happen in
+    :func:`delete_or_archive_competency_criteria_group`, so a refused user gets 403 and a root group gets 400.
     """
 
     serializer_class = CompetencyCriteriaGroupUpdateSerializer
-    http_method_names = ["patch"]
+    http_method_names = ["patch", "delete"]
     authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
     permission_classes = [IsAuthenticated, CompetencyReadPermission]
 
@@ -273,3 +283,64 @@ class CompetencyCriteriaGroupDetailView(generics.GenericAPIView):
         except CompetencyCriteriaGroupArchivedError as exc:
             raise CompetencyCriteriaConflict(str(exc)) from exc
         return Response(CompetencyCriteriaGroupSerializer(group).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, *args, **kwargs):
+        """
+        Resolve the group scoped to both path segments, then delegate to the public API, which checks permission.
+
+        The lookup keeps archived groups, so a repeat DELETE on an archived subtree still returns 200.
+        """
+        group = get_object_or_404(
+            CompetencyCriteriaGroup, pk=self.kwargs["group_id"], tag_id=self.kwargs["tag_id"],
+        )
+        try:
+            result = delete_or_archive_competency_criteria_group(group.id, request.user)
+        except CompetencyCriteriaGroup.DoesNotExist as exc:
+            # Removed between the lookup above and the API call.
+            raise NotFound() from exc
+        except DjangoValidationError as exc:
+            raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        return Response(
+            {
+                "id": result.id,
+                "archived": result.archived,
+                "cascaded_group_count": result.cascaded_group_count,
+                "cascaded_criteria_count": result.cascaded_criteria_count,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class CompetencyCriterionDeleteView(generics.GenericAPIView):
+    """
+    DELETE-only. Remove a CompetencyCriterion: hard-delete, or archive if learner status exists.
+
+    Does not call self.check_object_permissions(): the public API function checks
+    oel_tagging.can_tag_object itself and raises Django's PermissionDenied, which becomes a 403.
+    """
+
+    serializer_class = CompetencyCriterionSerializer
+    authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, *args, **kwargs):
+        """
+        Resolve the criterion scoped to both path segments, then delegate to the public API, which checks permission.
+
+        The URL is scoped by tag_id, not group_id, because its caller (#710) sends exactly
+        ``DELETE .../competencies/<tag_id>/criteria/<criterion_id>/`` and has no group id. The
+        lookup deliberately does not filter `archived=False`, so a repeat
+        DELETE against an already-archived row still resolves (200), and a mismatched tag_id or a
+        nonexistent criterion_id both 404 the same way, via this one get_object_or_404 call.
+        """
+        criterion = get_object_or_404(
+            CompetencyCriterion, pk=self.kwargs["criterion_id"], group__tag_id=self.kwargs["tag_id"],
+        )
+        try:
+            result = delete_or_archive_competency_criterion(criterion.id, request.user)
+        except CompetencyCriterion.DoesNotExist as exc:
+            # Removed between the lookup above and the API call.
+            raise NotFound() from exc
+        except DjangoValidationError as exc:
+            raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        return Response({"id": result.id, "archived": result.archived}, status=status.HTTP_200_OK)
