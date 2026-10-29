@@ -1,6 +1,7 @@
 """
 Tests for the CBE public API surface (openedx_learning.api).
 """
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -1338,13 +1339,13 @@ def test_get_competency_criteria_tree_costs_a_bounded_number_of_queries(
     tag: Tag, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile, django_assert_num_queries,
 ) -> None:
     """
-    Reading several groups and criteria costs two queries unscoped and three scoped, not one per row.
+    Reading several groups and criteria costs two queries unscoped and four scoped, not one per row.
 
     Pins the select_related("course")/select_related("object_tag") calls in
     get_competency_criteria_tree(): dropping either would still pass every other test in this
     module (the rows returned would be identical), since select_related only changes how many
-    queries fetch them, not which rows come back. The extra scoped query resolves the course
-    keys to course run ids.
+    queries fetch them, not which rows come back. The two extra scoped queries resolve the course
+    keys to course run ids and count the criteria under every reachable group.
     """
     leaf = _create_leaf_group(tag, course_run)
     assert course_run.course_key is not None
@@ -1359,12 +1360,44 @@ def test_get_competency_criteria_tree_costs_a_bounded_number_of_queries(
         for criterion in tree.criteria:
             _ = criterion.object_tag
 
-    with django_assert_num_queries(3):
+    with django_assert_num_queries(4):
         tree = get_competency_criteria_tree(tag, [course_run.course_key])
         for group in tree.groups:
             _ = group.course
         for criterion in tree.criteria:
             _ = criterion.object_tag
+
+
+def test_get_competency_criteria_tree_scoped_fetches_only_the_scoped_criteria_and_counts_the_rest(
+    tag: Tag, course_run: CourseRun, organization: Organization, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    A scoped read fetches criteria rows only for the groups it returns, and gets total_criteria_count
+    from a COUNT, so criteria of a course that was not requested are never loaded.
+    """
+    other_run = make_course_run(organization, "Python200", "Fall2026")
+    leaf = _create_leaf_group(tag, course_run)
+    other_leaf = _create_leaf_group(tag, other_run)
+    for run, group in ((course_run, leaf), (other_run, other_leaf)):
+        object_tag = ObjectTag.objects.create(object_id=usage_key(run, "p1"), taxonomy=tag.taxonomy, tag=tag)
+        CompetencyCriterion.objects.create(group=group, object_tag=object_tag, rule_profile=default_rule_profile)
+    assert course_run.course_key is not None
+    assert other_leaf.parent is not None
+
+    with CaptureQueriesContext(connection) as queries:
+        tree = get_competency_criteria_tree(tag, [course_run.course_key])
+
+    criterion_queries = [q["sql"] for q in queries.captured_queries if "competencycriterion" in q["sql"].lower()]
+    selects = [sql for sql in criterion_queries if "COUNT(" not in sql.upper()]
+    counts = [sql for sql in criterion_queries if "COUNT(" in sql.upper()]
+    assert len(selects) == 1 and len(counts) == 1
+    in_list = re.search(r"IN \(([^)]*)\)", selects[0])
+    assert in_list is not None
+    selected_group_ids = {int(i) for i in re.findall(r"\d+", in_list.group(1))}
+    assert other_leaf.id not in selected_group_ids
+    assert other_leaf.parent.id not in selected_group_ids
+    assert tree.criteria_count == 1
+    assert tree.total_criteria_count == 2
 
 
 def test_get_competency_criteria_tree_costs_one_query_when_the_competency_has_no_groups(

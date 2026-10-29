@@ -252,22 +252,26 @@ def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None =
                 ranked_groups.append((rank_by_run_id[group_course_id], group))
         scoped_groups = [group for _, group in sorted(ranked_groups, key=lambda ranked: ranked[0])]
 
-    all_criteria = list(
-        CompetencyCriterion.objects.filter(group_id__in=branch_course_ids.keys(), archived=False)
+    position_by_group_id = {group.id: position for position, group in enumerate(scoped_groups)}
+    criteria = list(
+        CompetencyCriterion.objects.filter(group_id__in=position_by_group_id.keys(), archived=False)
         .select_related("object_tag")
         .order_by("group_id", "id")
     )
-    position_by_group_id = {group.id: position for position, group in enumerate(scoped_groups)}
-    criteria = sorted(
-        (criterion for criterion in all_criteria if criterion.group_id in position_by_group_id),
-        key=lambda criterion: position_by_group_id[criterion.group_id],
-    )
+    # sort() is stable, so criteria of one group keep their id order.
+    criteria.sort(key=lambda criterion: position_by_group_id[criterion.group_id])
+    if course_keys is None:
+        total_criteria_count = len(criteria)
+    else:
+        total_criteria_count = CompetencyCriterion.objects.filter(
+            group_id__in=branch_course_ids.keys(), archived=False,
+        ).count()
 
     return CompetencyCriteriaTree(
         groups=scoped_groups,
         criteria=criteria,
         criteria_count=len(criteria),
-        total_criteria_count=len(all_criteria),
+        total_criteria_count=total_criteria_count,
     )
 
 
