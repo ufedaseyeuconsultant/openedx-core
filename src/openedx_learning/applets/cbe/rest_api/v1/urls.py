@@ -37,9 +37,4 @@ urlpatterns = [
         views.CompetencyCriterionDeleteView.as_view(),
         name="criterion-delete",
     ),
-    path(
-        "competencies/<int:tag_id>/criteria-groups/<int:group_id>/",
-        views.CompetencyCriteriaGroupDeleteView.as_view(),
-        name="group-delete",
-    ),
 ]
