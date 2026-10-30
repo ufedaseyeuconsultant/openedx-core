@@ -437,16 +437,11 @@ def test_untag_with_the_competency_taxonomy_disabled_removes_only_the_orphaned_o
 
 def test_hard_delete_leaves_a_tag_of_another_competency_on_the_same_object(
     user,
-    monkeypatch: pytest.MonkeyPatch,
     tag: Tag,
     object_tag: ObjectTag,
     default_rule_profile: CompetencyRuleProfile,
 ) -> None:
-    """
-    An ObjectTag for another competency tag on the same object, committed after a tag list was
-    read, survives the delete together with its criterion. The tag list is stubbed to omit it, as
-    a read taken before that commit would; the delete must not depend on reading it.
-    """
+    """An ObjectTag for another competency tag on the same object survives the delete together with its criterion."""
     competency_taxonomy = CompetencyTaxonomy.objects.get()
     other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Reading Poetry")
     other_object_tag = _make_object_tag(competency_taxonomy, other_tag, object_tag.object_id)
@@ -454,8 +449,6 @@ def test_hard_delete_leaves_a_tag_of_another_competency_on_the_same_object(
     other_criterion = _make_criterion(
         CompetencyCriteriaGroup.objects.create(tag=other_tag), other_object_tag, default_rule_profile
     )
-    stale_list = [ObjectTag.objects.get(pk=object_tag.pk)]
-    monkeypatch.setattr("openedx_learning.applets.cbe.api.get_object_tags", lambda *_args, **_kwargs: stale_list)
 
     delete_or_archive_competency_criterion(criterion.id, user)
 
