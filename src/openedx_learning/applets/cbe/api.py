@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Literal, Sequence, cast
 
 from django.core.exceptions import NON_FIELD_ERRORS, PermissionDenied, ValidationError
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import F, Q, QuerySet
 from django.db.transaction import TransactionManagementError
 from django.utils.translation import gettext_lazy as _
@@ -733,10 +733,19 @@ def _raise_leaf_status(user_id: int, criterion_id: int, status: MasteryStatus, n
     Returns the count of rows created or raised (0 or 1), matching the semantics of
     ``QuerySet.update()``'s own return value.
     """
-    row, created = StudentCompetencyCriterionStatus.objects.get_or_create(
-        user_id=user_id, criterion_id=criterion_id,
-        defaults={"status_id": status, "created": now, "modified": now},
-    )
+    try:
+        row, created = StudentCompetencyCriterionStatus.objects.get_or_create(
+            user_id=user_id, criterion_id=criterion_id,
+            defaults={"status_id": status, "created": now, "modified": now},
+        )
+    except IntegrityError:
+        # get_or_create() runs its INSERT in its own savepoint, so the grade's transaction is still usable.
+        # The only unresolved failure is a criterion deleted after it was read, which has no status to raise.
+        log.warning(
+            "Skipping CompetencyCriterion %s for user %s: it was deleted while the grade was being recorded.",
+            criterion_id, user_id,
+        )
+        return 0
     if created:
         return 1
     return StudentCompetencyCriterionStatus.objects.filter(
@@ -752,15 +761,16 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
     function returns without a deprecation cycle.
 
     Call this only from inside the same transaction that also writes the grade: this function opens
-    no transaction of its own and lets any storage error propagate rather than swallowing it, so the
+    no transaction of its own and lets any other storage error propagate rather than swallowing it, so the
     grade and its leaf statuses always commit or roll back together. Pass each ``object_id`` at most
     once, using the exact string already stored in ``ObjectTag.object_id``; the match performed
     against that value is case-sensitive. Leave out of ``scores`` any object worth zero possible
     points and any object the learner has not attempted. Only criteria whose tag belongs to a
     competency taxonomy are evaluated, and archived criteria are skipped. An evaluated criterion's
-    status is only ever raised, never lowered. The return value is the count of leaf rows created or
-    raised, where ``0`` means nothing changed. This function performs no authorization check of its
-    own; as with ``openedx_tagging.api``, the caller is responsible for enforcing permissions.
+    status is only ever raised, never lowered. A criterion deleted while the grade is being recorded is
+    skipped. The return value is the count of leaf rows created or raised, where ``0`` means nothing
+    changed. This function performs no authorization check of its own; as with ``openedx_tagging.api``, the
+    caller is responsible for enforcing permissions.
 
     :raises TransactionManagementError: if called outside an atomic block.
     """
@@ -986,6 +996,9 @@ def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) ->
 
     The whole operation runs in one transaction that locks only the competency's Tag, the same lock
     a create for that competency takes first, so a concurrent create waits until this call commits.
+
+    A learner status written concurrently, after this call's progress check, makes the call
+    archive the criterion instead of deleting it.
     """
     criterion = CompetencyCriterion.objects.select_related("group__tag__taxonomy", "object_tag").get(pk=criterion_id)
     # A group's tag is always a competency tag, so its taxonomy is always set.
@@ -1005,11 +1018,19 @@ def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) ->
             return CriterionDeletionResult(id=criterion_id, archived=True)
         group = criterion.group
         object_tag = criterion.object_tag
-        criterion.delete()
-        # Only this criterion's own ObjectTag is a candidate, and only while no other criterion uses it.
-        if not CompetencyCriterion.objects.filter(object_tag_id=object_tag.id).exists():
-            ObjectTag.objects.filter(pk=object_tag.id).delete()
-        _cascade_from_group(group, "delete", user)
+        try:
+            # Savepoint: a learner status committed after the progress check above makes the delete
+            # fail on its PROTECT foreign key, and only this block must roll back.
+            with transaction.atomic():
+                criterion.delete()
+                # Only this criterion's own ObjectTag is a candidate, and only while no other criterion uses it.
+                if not CompetencyCriterion.objects.filter(object_tag_id=object_tag.id).exists():
+                    ObjectTag.objects.filter(pk=object_tag.id).delete()
+                _cascade_from_group(group, "delete", user)
+        except IntegrityError:
+            # The rolled-back block may have cleared the pk of in-memory instances it had already deleted.
+            _archive_criterion(CompetencyCriterion.objects.get(pk=criterion_id), user)
+            return CriterionDeletionResult(id=criterion_id, archived=True)
         return CriterionDeletionResult(id=criterion_id, archived=False)
 
 
@@ -1121,6 +1142,9 @@ def delete_or_archive_competency_criteria_group(group_id: int, user: UserType) -
     a create or a criterion delete for that competency takes first, so those wait until this call
     commits.
 
+    A learner status written concurrently, after this call's progress check, makes the call
+    archive the subtree instead of deleting it.
+
     Raises CompetencyCriteriaGroup.DoesNotExist if no such group exists (including one deleted
     concurrently), PermissionDenied if ``user`` may not tag the course's object, and
     ValidationError (keyed "group_id") if `group_id` names a root CompetencyCriteriaGroup or a
@@ -1142,18 +1166,26 @@ def delete_or_archive_competency_criteria_group(group_id: int, user: UserType) -
         target_group = CompetencyCriteriaGroup.objects.get(pk=group_id)
         subtree_ids, criteria = _competency_criteria_subtree(target_group)
         criterion_ids = [criterion.pk for criterion in criteria]
-        has_progress = _subtree_has_learner_progress(subtree_ids, criterion_ids)
-        if has_progress:
+        archived = _subtree_has_learner_progress(subtree_ids, criterion_ids)
+        if not archived:
+            try:
+                # Savepoint: a learner status committed after the progress check above makes the delete
+                # fail on its PROTECT foreign key, and only this block must roll back.
+                with transaction.atomic():
+                    parent_group = target_group.parent
+                    target_group.delete()
+                    _delete_orphaned_object_tags({criterion.object_tag_id for criterion in criteria})
+                    if parent_group is not None:
+                        _cascade_from_group(parent_group, "delete", user)
+            except IntegrityError:
+                archived = True
+                # The rolled-back block may have cleared the pk of in-memory instances it had already deleted.
+                target_group = CompetencyCriteriaGroup.objects.get(pk=group_id)
+        if archived:
             _archive_competency_criteria_subtree(target_group, subtree_ids, criteria, user)
-        else:
-            parent_group = target_group.parent
-            target_group.delete()
-            _delete_orphaned_object_tags({criterion.object_tag_id for criterion in criteria})
-            if parent_group is not None:
-                _cascade_from_group(parent_group, "delete", user)
         return GroupDeletionResult(
             id=group_id,
-            archived=has_progress,
+            archived=archived,
             cascaded_group_count=len(subtree_ids) - 1,
             cascaded_criteria_count=len(criteria),
         )

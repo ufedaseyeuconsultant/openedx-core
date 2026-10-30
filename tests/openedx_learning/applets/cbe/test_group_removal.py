@@ -2,6 +2,7 @@
 from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import rules
@@ -11,6 +12,7 @@ from rules.permissions import permissions as rule_permissions
 
 from openedx_catalog.models import CourseRun
 from openedx_learning.api import delete_or_archive_competency_criteria_group, resolve_competency_criteria_group_course
+from openedx_learning.applets.cbe import api as cbe_api
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -342,6 +344,51 @@ def test_hard_delete_removes_an_object_tag_shared_by_two_criteria_in_the_subtree
     assert result.archived is False
     assert not CompetencyCriterion.objects.filter(group_id__in=[target.id, child.id]).exists()
     assert not ObjectTag.objects.filter(id=object_tag.id).exists()
+
+
+def test_learner_status_committed_after_the_progress_check_archives_instead_of_deleting(
+    user, *, tag: Tag, course_run: CourseRun, object_tag: ObjectTag,
+    default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """
+    A status row that lands after the progress check makes the hard delete fail on the PROTECT
+    foreign key; the call archives the subtree instead of raising, and keeps every ObjectTag.
+    """
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    target = CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root)
+    criterion = _make_criterion(target, object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    with patch.object(cbe_api, "_subtree_has_learner_progress", return_value=False):
+        result = delete_or_archive_competency_criteria_group(target.id, user)
+
+    assert result.archived is True
+    assert result.cascaded_criteria_count == 1
+    target.refresh_from_db()
+    criterion.refresh_from_db()
+    assert target.archived is True
+    assert criterion.archived is True
+    assert ObjectTag.objects.filter(id=object_tag.id).exists()
+
+
+def test_group_status_committed_after_the_progress_check_archives_instead_of_deleting(
+    user, *, tag: Tag, course_run: CourseRun, now: datetime,
+) -> None:
+    """A group-level status row that lands after the progress check also falls back to archiving."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    target = CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root)
+    StudentCompetencyCriteriaGroupStatus.objects.create(
+        user=user, group=target, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    with patch.object(cbe_api, "_subtree_has_learner_progress", return_value=False):
+        result = delete_or_archive_competency_criteria_group(target.id, user)
+
+    assert result.archived is True
+    target.refresh_from_db()
+    assert target.archived is True
 
 
 def test_archive_when_status_exists_only_on_the_target_group(

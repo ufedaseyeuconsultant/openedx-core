@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import rules
@@ -110,6 +111,28 @@ def _latest_history_user(model_name: str, pk: int):
 def _history_count(model_name: str, pk: int) -> int:
     """Return how many historical rows exist for the ``model_name`` row ``pk``."""
     return apps.get_model("openedx_learning", model_name).objects.filter(id=pk).count()
+
+
+def test_learner_status_committed_after_the_progress_check_archives_instead_of_deleting(
+    user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """
+    A status row that lands after the progress check makes the hard delete fail on the PROTECT
+    foreign key; the call archives the criterion instead of raising, and keeps its ObjectTag.
+    """
+    group = CompetencyCriteriaGroup.objects.create(tag=tag)
+    criterion = _make_criterion(group, object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    with patch.object(cbe_api, "_criterion_has_learner_progress", return_value=False):
+        result = delete_or_archive_competency_criterion(criterion.id, user)
+
+    assert result.archived is True
+    criterion.refresh_from_db()
+    assert criterion.archived is True
+    assert ObjectTag.objects.filter(id=object_tag.id).exists()
 
 
 def test_repeat_delete_on_an_archived_criterion_writes_no_history(
