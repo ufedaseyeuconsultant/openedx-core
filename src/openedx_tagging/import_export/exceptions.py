@@ -95,6 +95,25 @@ class ParentCycleError(TagImportError):
         ).format(row=row, parent_id=parent_id)
 
 
+class DeletedParentError(TagImportError):
+    """
+    Exception raised when a row's parent_id names a tag that the import deletes.
+
+    ``row`` is the 1-based position of the row among the file's data rows, as
+    in ``TagImportPlan._validate_no_duplicate_final_ids``.
+    """
+
+    def __init__(self, row: int, parent_id: str, **kargs):
+        """
+        ``parent_id`` is shown as the row spells it.
+        """
+        super().__init__(**kargs)
+        self.message = _(
+            "Row {row}: Parent tag {parent_id} is deleted by this import, because the file has no row for it. "
+            "Add a row for {parent_id} or change the parent_id."
+        ).format(row=row, parent_id=parent_id)
+
+
 class TagTooDeepError(TagImportError):
     """
     Exception raised when the import would leave a tag deeper than the taxonomy allows.

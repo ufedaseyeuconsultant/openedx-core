@@ -183,7 +183,6 @@ class TestTagImportPlan(TestImportActionMixin, TestCase):
                 {
                     'id': 'tag_4',
                     'value': 'Tag 4',
-                    'parent_id': 'tag_3',
                 },
             ],
             True,
@@ -206,7 +205,7 @@ class TestTagImportPlan(TestImportActionMixin, TestCase):
                     'id': 'tag_3',
                 },
                 {
-                    'name': 'without_changes',
+                    'name': 'update_parent',
                     'id': 'tag_4',
                 },
             ]
@@ -325,7 +324,6 @@ class TestTagImportPlan(TestImportActionMixin, TestCase):
                 {
                     'id': 'tag_4',
                     'value': 'Tag 4',
-                    'parent_id': 'tag_3',
                 },
             ],
             True,
@@ -336,7 +334,8 @@ class TestTagImportPlan(TestImportActionMixin, TestCase):
             "#2: Delete tag <TagItem> (tag_1 / Tag 1)\n"
             "#3: Delete tag <TagItem> (tag_2 / Tag 2)\n"
             "#4: Delete tag <TagItem> (tag_3 / Tag 3)\n"
-            "#5: No changes needed for <TagItem> (tag_4 / Tag 4)\n"
+            "#5: Update the parent of <Tag> (tag_4 / Tag 4) from parent "
+            "<Tag> (tag_3 / Tag 3) to None\n"
         ),
     )
     @ddt.unpack
@@ -388,7 +387,6 @@ class TestTagImportPlan(TestImportActionMixin, TestCase):
                 {
                     'id': 'tag_4',
                     'value': 'Tag 4',
-                    'parent_id': 'tag_3',
                 },
             ],
             True,
@@ -408,11 +406,10 @@ class TestTagImportPlan(TestImportActionMixin, TestCase):
             assert tag.value == tag_item.value
 
             # Checks any parent update
-            if not replace:
-                if not tag_item.parent_id:
-                    assert tag.parent is None
-                else:
-                    assert tag.parent.external_id == tag_item.parent_id
+            if not tag_item.parent_id:
+                assert tag.parent is None
+            else:
+                assert tag.parent.external_id == tag_item.parent_id
 
             tag_external_ids.append(tag_item.id)
 
@@ -1126,6 +1123,106 @@ class TestTagImportPlan(TestImportActionMixin, TestCase):
             [str(error) for error in plan.errors],
             [f"This import would leave tag {named_tag} more than 6 levels deep."],
         )
+
+    @staticmethod
+    def _deleted_parent_message(row: int, parent_id: str) -> str:
+        """
+        The deleted parent error for the 1-based ``row`` that names ``parent_id``.
+        """
+        return (
+            f"Row {row}: Parent tag {parent_id} is deleted by this import, because the file has no row "
+            f"for it. Add a row for {parent_id} or change the parent_id."
+        )
+
+    def _error_messages(self) -> list[str]:
+        """
+        The messages of the plan's errors.
+        """
+        return [str(error) for error in self.import_plan.errors]
+
+    def test_generate_actions_moved_tag_under_deleted_parent_rejected(self) -> None:
+        tags = [
+            TagItem(id='tag_1', value='Tag 1'),
+            TagItem(id='tag_2', value='Tag 2', parent_id='tag_3'),
+        ]
+        self.import_plan.generate_actions(tags=tags, replace=True)
+        assert self._error_messages() == [self._deleted_parent_message(2, "tag_3")]
+
+    @ddt.data("tag_3", "TAG_3")
+    def test_generate_actions_kept_tag_under_its_deleted_parent_rejected(self, parent_id: str) -> None:
+        """
+        A kept tag whose row names its own parent, with no row for that parent, is rejected.
+        """
+        tags = [TagItem(id='tag_4', value='Tag 4', parent_id=parent_id)]
+        self.import_plan.generate_actions(tags=tags, replace=True)
+        assert self._error_messages() == [self._deleted_parent_message(1, parent_id)]
+
+    @ddt.data(
+        TagItem(id='new_tag', value='New tag', parent_id='tag_3'),
+        TagItem(id='tag_50', value='Tag 1', previous_id='tag_1', parent_id='tag_3'),
+    )
+    def test_generate_actions_new_or_renamed_tag_under_deleted_parent_rejected(self, row: TagItem) -> None:
+        self.import_plan.generate_actions(tags=[row], replace=True)
+        assert self._error_messages() == [self._deleted_parent_message(1, "tag_3")]
+
+    def test_generate_actions_deleted_parent_reported_for_every_row(self) -> None:
+        """
+        Each row naming the deleted parent gets its own error, spelled as the row spells it.
+        """
+        tags = [
+            TagItem(id='tag_4', value='Tag 4', parent_id='tag_3'),
+            TagItem(id='new_tag', value='New tag', parent_id='TAG_3'),
+        ]
+        self.import_plan.generate_actions(tags=tags, replace=True)
+        assert self._error_messages() == [
+            self._deleted_parent_message(1, "tag_3"),
+            self._deleted_parent_message(2, "TAG_3"),
+        ]
+
+    def test_generate_actions_deleted_parent_matched_by_stored_id_without_regard_to_case(self) -> None:
+        """
+        A deleted tag whose stored id is uppercase is matched by a lowercase parent_id.
+        """
+        plan = self._plan_for_tree({'TAG_3': None, 'tag_4': 'TAG_3'})
+        plan.generate_actions(tags=[TagItem(id='tag_4', value='tag_4', parent_id='tag_3')], replace=True)
+        assert [str(error) for error in plan.errors] == [self._deleted_parent_message(1, "tag_3")]
+
+    def test_generate_actions_deleted_parent_ignored_without_replace(self) -> None:
+        """
+        Without replace nothing is deleted, so a parent the file omits is not rejected.
+        """
+        tags = [
+            TagItem(id='tag_4', value='Tag 4', parent_id='tag_3'),
+            TagItem(id='new_tag', value='New tag', parent_id='tag_3'),
+        ]
+        self.import_plan.generate_actions(tags=tags, replace=False)
+        assert self._error_messages() == []
+
+    def test_generate_actions_parent_renamed_away_is_not_deleted_parent(self) -> None:
+        """
+        A parent renamed away is not deleted: only the stale parent error applies.
+        """
+        tags = [
+            TagItem(id='tag_9', value='Tag 3', previous_id='tag_3'),
+            TagItem(id='tag_4', value='Tag 4', parent_id='tag_3'),
+        ]
+        self.import_plan.generate_actions(tags=tags, replace=True)
+        assert self._error_messages() == [
+            "Action error in 'update_parent' (#4): Row 2: Parent tag tag_3 is renamed to tag_9 in this file; "
+            "use tag_9 as the parent_id."
+        ]
+
+    def test_generate_actions_child_naming_id_renamed_onto_deleted_tag_accepted(self) -> None:
+        """
+        A tag renamed onto the id of a deleted tag holds that id in the final tree, so a
+        child naming the id is accepted.
+        """
+        tags = [
+            TagItem(id='tag_3', value='Tag 1', previous_id='tag_1'),
+            TagItem(id='tag_4', value='Tag 4', parent_id='TAG_3'),
+        ]
+        self.import_plan.generate_actions(tags=tags, replace=True)
+        assert self._error_messages() == []
 
     def test_generate_actions_genuine_collision_not_staged(self) -> None:
         """
