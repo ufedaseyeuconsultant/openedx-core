@@ -1,15 +1,20 @@
 """Tests for delete_or_archive_competency_criterion() and its ancestor-cascade helper, _cascade_from_group()."""
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import rules
 from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from rules.permissions import permissions as rule_permissions
 
 from openedx_learning.api import delete_or_archive_competency_criterion
+from openedx_learning.applets.cbe import api as cbe_api
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -106,6 +111,28 @@ def _latest_history_user(model_name: str, pk: int):
 def _history_count(model_name: str, pk: int) -> int:
     """Return how many historical rows exist for the ``model_name`` row ``pk``."""
     return apps.get_model("openedx_learning", model_name).objects.filter(id=pk).count()
+
+
+def test_learner_status_committed_after_the_progress_check_archives_instead_of_deleting(
+    user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """
+    A status row that lands after the progress check makes the hard delete fail on the PROTECT
+    foreign key; the call archives the criterion instead of raising, and keeps its ObjectTag.
+    """
+    group = CompetencyCriteriaGroup.objects.create(tag=tag)
+    criterion = _make_criterion(group, object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    with patch.object(cbe_api, "_criterion_has_learner_progress", return_value=False):
+        result = delete_or_archive_competency_criterion(criterion.id, user)
+
+    assert result.archived is True
+    criterion.refresh_from_db()
+    assert criterion.archived is True
+    assert ObjectTag.objects.filter(id=object_tag.id).exists()
 
 
 def test_repeat_delete_on_an_archived_criterion_writes_no_history(
@@ -410,16 +437,11 @@ def test_untag_with_the_competency_taxonomy_disabled_removes_only_the_orphaned_o
 
 def test_hard_delete_leaves_a_tag_of_another_competency_on_the_same_object(
     user,
-    monkeypatch: pytest.MonkeyPatch,
     tag: Tag,
     object_tag: ObjectTag,
     default_rule_profile: CompetencyRuleProfile,
 ) -> None:
-    """
-    An ObjectTag for another competency tag on the same object, committed after a tag list was
-    read, survives the delete together with its criterion. The tag list is stubbed to omit it, as
-    a read taken before that commit would; the delete must not depend on reading it.
-    """
+    """An ObjectTag for another competency tag on the same object survives the delete together with its criterion."""
     competency_taxonomy = CompetencyTaxonomy.objects.get()
     other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Reading Poetry")
     other_object_tag = _make_object_tag(competency_taxonomy, other_tag, object_tag.object_id)
@@ -427,8 +449,6 @@ def test_hard_delete_leaves_a_tag_of_another_competency_on_the_same_object(
     other_criterion = _make_criterion(
         CompetencyCriteriaGroup.objects.create(tag=other_tag), other_object_tag, default_rule_profile
     )
-    stale_list = [ObjectTag.objects.get(pk=object_tag.pk)]
-    monkeypatch.setattr("openedx_learning.applets.cbe.api.get_object_tags", lambda *_args, **_kwargs: stale_list)
 
     delete_or_archive_competency_criterion(criterion.id, user)
 
@@ -446,6 +466,35 @@ def test_does_not_exist_for_an_unknown_criterion_id(user) -> None:
     """The API layer lets DoesNotExist propagate for an unknown criterion_id so each caller can map it itself."""
     with pytest.raises(CompetencyCriterion.DoesNotExist):
         delete_or_archive_competency_criterion(999999999, user)
+
+
+def test_a_criterion_removed_with_its_group_before_the_lock_raises_does_not_exist(
+    user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, monkeypatch,
+) -> None:
+    """
+    A concurrent group delete that removes the criterion and its ancestors after the function's
+    pre-lock read, but before its Tag lock, surfaces as CompetencyCriterion.DoesNotExist.
+
+    The race is simulated without threads: the ``transaction`` name the api module uses is swapped
+    for one whose ``atomic`` (the function's only use of it) first hard-deletes the group chain,
+    cascading to the criterion, and then opens the real transaction. That is the point between the
+    pre-lock read and the Tag lock.
+    """
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    group = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    criterion = _make_criterion(group, object_tag, default_rule_profile)
+    real_atomic = transaction.atomic
+
+    @contextmanager
+    def delete_chain_then_atomic() -> Iterator[None]:
+        CompetencyCriteriaGroup.objects.filter(pk=root.pk).delete()
+        with real_atomic():
+            yield
+
+    monkeypatch.setattr(cbe_api, "transaction", SimpleNamespace(atomic=delete_chain_then_atomic))
+
+    with pytest.raises(CompetencyCriterion.DoesNotExist):
+        delete_or_archive_competency_criterion(criterion.id, user)
 
 
 # =================================================================================================

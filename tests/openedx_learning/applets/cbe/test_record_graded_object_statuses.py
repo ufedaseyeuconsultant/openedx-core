@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.transaction import TransactionManagementError
 from freezegun import freeze_time
 
@@ -431,6 +431,52 @@ def test_storage_error_propagates(
         )
 
     assert not StudentCompetencyCriterionStatus.objects.filter(criterion=criterion).exists()
+
+
+def test_criterion_deleted_during_the_write_is_skipped_and_the_rest_are_recorded(
+    user, criterion: CompetencyCriterion, object_tag: ObjectTag, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An IntegrityError from one criterion's insert, as when a concurrent delete removes the
+    criterion, is logged and skipped so the grade's transaction still commits the other leaf rows.
+    """
+    competency_taxonomy = object_tag.taxonomy
+    doomed_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Doomed")
+    doomed_group = CompetencyCriteriaGroup.objects.create(tag=doomed_tag)
+    doomed_object_tag = ObjectTag.objects.create(
+        object_id="block-v1:Org1+Python100+Fall2026+problem+doomed", taxonomy=competency_taxonomy, tag=doomed_tag,
+    )
+    doomed = _make_criterion(
+        group=doomed_group, object_tag=doomed_object_tag, rule_profile=criterion.rule_profile,
+    )
+    real_get_or_create = StudentCompetencyCriterionStatus.objects.get_or_create
+
+    def _fail_for_doomed(*args, **kwargs):
+        if kwargs.get("criterion_id") == doomed.pk:
+            raise IntegrityError("FOREIGN KEY constraint failed")
+        return real_get_or_create(*args, **kwargs)
+
+    monkeypatch.setattr(StudentCompetencyCriterionStatus.objects, "get_or_create", _fail_for_doomed)
+
+    with caplog.at_level(logging.WARNING, logger="openedx_learning.applets.cbe.api"):
+        with transaction.atomic():
+            changed = record_graded_object_statuses(
+                user_id=user.id,
+                scores=[
+                    GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.9")),
+                    GradedObjectScore(object_id=doomed_object_tag.object_id, fraction=Decimal("0.9")),
+                ],
+            )
+            assert StudentCompetencyCriterionStatus.objects.filter(criterion=criterion).exists()
+
+    assert changed == 1
+    assert not StudentCompetencyCriterionStatus.objects.filter(criterion=doomed).exists()
+    assert any(
+        record.levelname == "WARNING"
+        and f"CompetencyCriterion {doomed.pk} for user {user.id}" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_duplicate_object_id_raises_value_error(user, django_assert_num_queries) -> None:
