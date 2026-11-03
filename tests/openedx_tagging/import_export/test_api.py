@@ -1241,6 +1241,16 @@ class TestImportAcceptanceScenarios(TestCase):
         """
         return f"Row {position}'s parent_id ({parent_id}) creates a parent cycle."
 
+    @staticmethod
+    def _deleted_parent_error(position: int, parent_id: str) -> str:
+        """
+        Return the deleted parent message for the 1-based row ``position`` that names ``parent_id``.
+        """
+        return (
+            f"Row {position}: Parent tag {parent_id} is deleted by this import, because the file has no row "
+            f"for it. Add a row for {parent_id} or change the parent_id."
+        )
+
     def _first_row_of(self, file_rows: list[TagItem], members: list[TagItem]) -> tuple[int, str | None]:
         """
         Return the 1-based position in ``file_rows`` and the parent_id of the first row among ``members``.
@@ -1394,6 +1404,17 @@ class TestImportAcceptanceScenarios(TestCase):
                 assert Tag.objects.get(pk=pks["COMP-Y"]).external_id == "COMP-X"
                 self._assert_associations_kept(object_tags)
                 assert self._exported_parents() == {"Yank": None, "Child": "COMP-X"}
+        # The child names the id in another case.
+        other_case_rows = [rows[0], TagItem(id="COMP-C", value="Child", parent_id="comp-x")]
+        for order in self._orders(len(other_case_rows)):
+            with self.subTest(order=order, parent_id="comp-x"), self._rolled_back():
+                result, _log, _plan = self._import([other_case_rows[i] for i in order])
+                assert result
+                assert not Tag.objects.filter(pk=pks["COMP-X"]).exists()
+                assert Tag.objects.get(pk=pks["COMP-C"]).parent_id == pks["COMP-Y"]
+                assert Tag.objects.get(pk=pks["COMP-Y"]).external_id == "COMP-X"
+                self._assert_associations_kept(object_tags)
+                assert self._exported_parents() == {"Yank": None, "Child": "COMP-X"}
 
     def test_kept_tags_under_deleted_ancestors_become_roots(self) -> None:
         """
@@ -1432,11 +1453,85 @@ class TestImportAcceptanceScenarios(TestCase):
             kept = [TagItem(id=tag.id, value=tag.value) for tag in before if tag.id in kept_ids]
             with self.subTest(case=name), self._rolled_back():
                 pks = self._seed(before)
+                object_tags = self._associate(pks, *kept_ids)
                 result, _log, _plan = self._import(kept)
                 assert result
+                self._assert_associations_kept(object_tags)
                 assert set(self.taxonomy.tag_set.values_list("pk", flat=True)) == {pks[t.id] for t in kept}
                 assert all(tag.parent_id is None for tag in self.taxonomy.tag_set.all())
                 assert self._exported_parents() == {t.value: None for t in kept}
+
+    def test_kept_child_of_deleted_tag_moves_under_named_kept_tag(self) -> None:
+        """
+        A kept tag whose old parent the import deletes moves under the kept tag its row names,
+        and keeps its pk.
+        """
+        pks = self._seed([
+            TagItem(id="tag_1", value="Tag one"),
+            TagItem(id="tag_3", value="Tag three"),
+            TagItem(id="tag_4", value="Tag four", parent_id="tag_3"),
+        ])
+        rows = [
+            TagItem(id="tag_1", value="Tag one"),
+            TagItem(id="tag_4", value="Tag four", parent_id="tag_1"),
+        ]
+        self._assert_tree_after_import(
+            rows=rows,
+            expected_parents={"tag_1": None, "tag_4": "tag_1"},
+            pks={"tag_1": pks["tag_1"], "tag_4": pks["tag_4"]},
+        )
+
+    def test_rows_naming_a_deleted_tag_are_rejected(self) -> None:
+        """
+        A row whose parent_id names a tag that the import deletes is rejected with the deleted
+        parent error, whether the row moves, keeps, creates or renames a tag, and whatever the
+        case of the parent_id.
+        """
+        one = TagItem(id="tag_1", value="Tag one")
+        three = TagItem(id="tag_3", value="Tag three")
+        four_under_three = TagItem(id="tag_4", value="Tag four", parent_id="tag_3")
+        two_under_one = TagItem(id="tag_2", value="Tag two", parent_id="tag_1")
+        two_under_three = TagItem(id="tag_2", value="Tag two", parent_id="tag_3")
+        new_under_three = TagItem(id="new_tag", value="New tag", parent_id="tag_3")
+        renamed_under_three = TagItem(id="tag_50", value="Tag one", previous_id="tag_1", parent_id="tag_3")
+        four_under_other_case = TagItem(id="tag_4", value="Tag four", parent_id="TAG_3")
+        upper_three = TagItem(id="TAG_3", value="Tag three")
+        four_under_upper_three = TagItem(id="tag_4", value="Tag four", parent_id="TAG_3")
+        chain = [
+            TagItem(id="tag_2", value="Tag two"),
+            TagItem(id="tag_3", value="Tag three", parent_id="tag_2"),
+            four_under_three,
+        ]
+        # Each case is (starting tags, file rows, the file rows that name a deleted tag).
+        cases = {
+            "moved under a deleted tag": ([one, two_under_one, three], [one, two_under_three], [two_under_three]),
+            "keeps its deleted parent": ([three, four_under_three], [four_under_three], [four_under_three]),
+            "new tag under a deleted tag": ([one, three], [one, new_under_three], [new_under_three]),
+            "renamed tag under a deleted tag": ([one, three], [renamed_under_three], [renamed_under_three]),
+            "case variant": ([three, four_under_three], [four_under_other_case], [four_under_other_case]),
+            "parent inside a deleted chain": (chain, [four_under_three], [four_under_three]),
+            "stored id in another case": (
+                [upper_three, four_under_upper_three], [four_under_three], [four_under_three],
+            ),
+            "every row naming it": (
+                [three, four_under_three],
+                [four_under_three, new_under_three],
+                [four_under_three, new_under_three],
+            ),
+        }
+        for name, case in cases.items():
+            seed, rows, offending = case
+            for order in self._orders(len(rows)):
+                with self.subTest(case=name, order=order), self._rolled_back():
+                    pks = self._seed(seed)
+                    file_rows = [rows[i] for i in order]
+                    messages = []
+                    for row in offending:
+                        assert row.parent_id is not None
+                        messages.append(self._deleted_parent_error(file_rows.index(row) + 1, row.parent_id))
+                    self._assert_rejected(file_rows, messages=messages, error_count=len(messages))
+                    if name == "keeps its deleted parent":
+                        assert Tag.objects.get(pk=pks["tag_4"]).parent_id == pks["tag_3"]
 
     # deep_tag is at the fifth level, so a child of deep_tag is at the sixth, the deepest allowed.
     deep_chain = (

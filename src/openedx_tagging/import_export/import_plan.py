@@ -21,6 +21,7 @@ from .actions import (
     available_actions,
 )
 from .exceptions import (
+    DeletedParentError,
     DuplicateFinalIdError,
     ParentCycleError,
     StaleIdTargetedByPlainRowError,
@@ -354,9 +355,9 @@ class TagImportPlan:
         are recorded as 1-based numbers in ``indexed_actions["_rows_on_a_cycle"]``, so
         that ``_validate_parent`` does not also report an unknown parent for them.
 
-        A parent_id that is no tag of the final tree counts as a root
-        here: it is unknown, which ``_validate_parent`` reports, or deleted without a
-        row reclaiming it, and the delete phase promotes its children.
+        A parent_id that is no tag of the final tree counts as a root here.
+        ``_validate_parent`` reports an unknown id or an id this file renames away, and
+        ``_validate_no_parent_is_deleted`` reports a deleted one.
         """
         rows_on_a_cycle: set[int] = set()
         depth_of: dict[str, int] = {}
@@ -399,6 +400,20 @@ class TagImportPlan:
             tag_id = tags[row_of[key]].id if key in row_of else existing[key].external_id
             self.errors.append(TagTooDeepError(tag_id, TAXONOMY_MAX_DEPTH + 1))
 
+    def _validate_no_parent_is_deleted(self, tags: list[TagItem], parent_of: dict[str, str | None]) -> None:
+        """
+        Reject each row whose parent_id names a tag the import deletes.
+
+        A row is accepted when a tag of the final tree holds that id, as a tag renamed
+        onto the deleted tag's id does. Ids are compared without regard to case, and
+        every offending row gets its own error. Must run after the delete actions
+        are built.
+        """
+        deleted = {action.tag.id.casefold() for action in self.indexed_actions["delete"]}
+        for position, tag in enumerate(tags, start=1):
+            if tag.parent_id and tag.parent_id.casefold() in deleted and tag.parent_id.casefold() not in parent_of:
+                self.errors.append(DeletedParentError(position, tag.parent_id))
+
     def _build_detach_actions(
         self, existing: dict[str, ExistingTag], parent_of: dict[str, str | None], pk_of: dict[str, int],
     ) -> None:
@@ -418,7 +433,10 @@ class TagImportPlan:
                 continue  # The delete phase already promotes a kept child of a deleted tag.
             parent_key = parent_of[key]
             if parent_key is not None and parent_key not in pk_of:
-                continue  # The parent_id names no tag of the final tree: left to _validate_parent.
+                # The parent_id names no tag of the final tree, and the plan rejects that row:
+                # _validate_parent reports an unknown id or an id renamed away,
+                # _validate_no_parent_is_deleted reports a deleted one.
+                continue
             final_parent_pk = pk_of[parent_key] if parent_key is not None else None
             if final_parent_pk != info.parent_pk:
                 self._build_action(DetachTag, TagItem(id=info.external_id, value=info.value), target_pk=pk)
@@ -520,9 +538,11 @@ class TagImportPlan:
         # execution order regardless of how the rows are ordered in the file.
         self._build_staging_actions(tags)
 
-        # Reject a cycle or an overflow of the final tree, then detach every moved tag.
+        # Reject a cycle, an overflow of the final tree, or a parent the import deletes,
+        # then detach every moved tag.
         parent_of, pk_of, row_of = self._end_state(tags, existing)
         self._validate_hierarchy(tags, existing, parent_of, row_of)
+        self._validate_no_parent_is_deleted(tags, parent_of)
         self._build_detach_actions(existing, parent_of, pk_of)
 
         for position in self._order_rows_parent_first(tags, existing):
