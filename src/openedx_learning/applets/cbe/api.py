@@ -437,8 +437,11 @@ def create_competency_criterion(
 
     ``course_run`` is ``group``'s course. Must run inside a transaction. This function takes the
     competency's Tag row lock itself, so a concurrent delete of a sibling criterion can't cascade
-    this call's new rows away. The caller must also hold the course run lock that
-    associate_competency_criterion() takes, so the dominance check below can't race another create.
+    this call's new rows away. It takes the lock here, not only in its caller, so a future direct
+    caller of this public function can't bypass it: the delete path's correctness depends on every
+    creator holding it. The caller must also hold the course run lock that
+    associate_competency_criterion() takes, so the dominance check below can't race another create,
+    and must take the Tag lock before the course run lock.
     """
     # Re-acquiring the lock associate_competency_criterion() already holds is harmless within one transaction.
     Tag.objects.select_for_update().get(pk=group.tag_id)
@@ -709,9 +712,6 @@ def bulk_update_competency_criteria(
     names, for a non-leaf group, an empty or repeated id list, or an invalid rule source. Raises
     CompetencyCriterionArchivedError if the group, either of its ancestors, or any named criterion
     is archived. Raises Tag.DoesNotExist if the group's competency tag was deleted concurrently.
-
-    Takes the competency's Tag row lock before reading anything that can change, like every writer of
-    its criteria, so it waits for a concurrent create or delete of the same competency.
     """
     with transaction.atomic():
         group = CompetencyCriteriaGroup.objects.select_related("tag__taxonomy", "parent__course").get(
@@ -732,10 +732,12 @@ def bulk_update_competency_criteria(
             raise ValidationError({"criterion_ids": _("criterion_ids must not name the same criterion twice.")})
         _validate_rule_source(rule_profile_id, rule_type_override, rule_payload_override)
 
-        # Every writer of a competency's criteria takes its Tag row lock first, and none takes another row lock
-        # before it, so the writers can't deadlock. Everything below reads committed state, since a delete, an archive
-        # or a create for this competency can't commit while this transaction holds the lock. The reads
-        # above are safe without it because a group's tag, parent and course never change.
+        # Every CBE authoring writer of a competency's criteria takes its Tag row lock first and no other row lock
+        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag, a Taxonomy
+        # or a CourseRun take the Tag row last, and can deadlock with a create or a hard delete: one side fails
+        # with a MySQL 1213 error and no data is corrupted. Everything below reads committed state, since a
+        # delete, an archive or a create for this competency can't commit while this transaction holds the lock.
+        # The reads above are safe without it because a group's tag, parent and course never change.
         Tag.objects.select_for_update().get(pk=group.tag_id)
 
         # Archiving a group doesn't archive its criteria, yet ADR 0002 Decision 2 closes them to authoring.
@@ -898,9 +900,6 @@ def update_competency_criteria_group(
     PermissionDenied if ``user`` fails ``oel_tagging.can_tag_object`` for the group's taxonomy and
     course. Raises CompetencyCriteriaGroupArchivedError if the group is archived, even when nothing
     would change.
-
-    Takes the competency's Tag row lock and re-reads the group under it, like every writer of the
-    competency's criteria, so a concurrent delete that archived or removed the group is seen.
     """
     with transaction.atomic():
         group = CompetencyCriteriaGroup.objects.select_related("course", "parent__course").get(pk=group_id)
@@ -963,10 +962,7 @@ def _archive_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
 
 def _cascade_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
     """
-    Walk ``group`` and its ancestors, collapsing/archiving any left with no live children.
-
-    Checking both relations (``criteria`` and ``child_groups``) at every level is harmless: the one that
-    does not apply is an empty queryset, and it avoids a separate leaf/non-leaf code path.
+    Walk ``group`` and its ancestors, deleting or archiving any left with no live children.
 
     An archived group is never saved again: everything above it was handled when it was archived,
     so a second save would only add a redundant history row. If it has no criteria, no child groups
@@ -1048,27 +1044,30 @@ def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) ->
     ``PermissionDenied`` if ``user`` fails the permission check, and Django's ``ValidationError`` if
     the archive path's ``full_clean()`` rejects an invalid stored rule payload.
 
-    The first read and the permission check run before the lock. The rest runs in one
-    transaction that locks only the competency's Tag row, the lock every writer of its criteria takes
-    first, so a concurrent create waits until this call commits. The lock prevents three races that
-    follow from Django's Python-side cascade. A create that commits a new leaf and criterion between
-    the ancestor walk's emptiness check and the row-collecting SELECT inside ``group.delete()`` would
-    have those rows deleted silently, after the create call already returned success. Two deletes of
-    sibling criteria in one leaf would each still see the other's criterion and leave an empty leaf
-    behind. A create that reuses the same ``ObjectTag`` and commits between the "still referenced"
-    check and the ``ObjectTag`` delete would have its criterion cascaded away. The lock is held until
-    the request commits, so other authoring writers for this competency, and inserts that reference
-    its Tag row, wait meanwhile.
+    The first read and the permission check run before the lock. The rest runs in one transaction that
+    takes only one explicit lock, on the competency's Tag row, the lock every CBE authoring writer of its
+    criteria takes first, so a concurrent create waits until this call commits. The lock is held until the
+    request commits, so other authoring writers for this competency, and inserts that reference its Tag
+    row, wait meanwhile.
 
     The re-read under the lock and the ancestor walk's ``exists()`` checks rely on READ COMMITTED, the
     isolation level this repo always runs (see ``AGENTS.md``): they must see concurrent commits.
 
-    A learner's grade saved at the same moment as a hard delete fails one side with an error. The delete
-    checks for a status row and then deletes the criterion, and a grade write that inserts a status row
-    in between is not waited for. If the status INSERT comes first, this delete waits for the grade
-    transaction and then fails the foreign-key check, and a second delete archives the criterion. If the
-    DELETE comes first, the grade's INSERT waits for it to commit and then fails inside the learner's
-    grade transaction.
+    A learner's grade saved at the same moment as a hard delete never loses data silently, but it can
+    fail one side with an error. The delete checks for a status row and then deletes the criterion, and a
+    grade write that inserts a status row in between is not waited for. There are three variants when
+    the grade is the one that gets in first:
+
+    - A status row committed before the status check: the delete archives the criterion, the normal path.
+    - A status row committed after the check and before ``criterion.delete()`` collects its rows:
+      ``ProtectedError``.
+    - A status row inserted but not yet committed when the delete runs: the delete waits for the grade
+      transaction, then fails the foreign-key check with ``IntegrityError``.
+
+    ``ProtectedError`` is a subclass of ``IntegrityError``. Either one rolls this transaction back and
+    leaves the criterion in place, and the REST view maps both to a retryable 409, since a second delete
+    archives the criterion. If the DELETE comes first instead, the grade's INSERT waits for it to commit
+    and then fails inside the learner's grade transaction.
     """
     criterion = CompetencyCriterion.objects.select_related("group__tag__taxonomy", "object_tag").get(pk=criterion_id)
     # The create path only accepts competency tags, and a group's tag never changes, so its taxonomy is set.
@@ -1079,6 +1078,13 @@ def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) ->
         raise PermissionDenied()
     tag_id = criterion.group.tag_id
     with transaction.atomic():
+        # A lock rather than a constraint, because Django cascades deletes in Python and the database can't
+        # catch three races that follow. A create that commits a new leaf and criterion between the ancestor
+        # walk's emptiness check and the row-collecting SELECT inside ``group.delete()`` would have those rows
+        # deleted silently, after the create call already returned success. Two deletes of sibling criteria in
+        # one leaf would each still see the other's criterion and leave an empty leaf behind. A create that
+        # reuses the same ObjectTag and commits between the "still referenced" check and the ObjectTag delete
+        # would have its criterion cascaded away.
         Tag.objects.select_for_update().get(pk=tag_id)
         # Re-read under the Tag lock: a concurrent delete may have won; DoesNotExist propagates to the caller.
         criterion = CompetencyCriterion.objects.select_related("group", "object_tag").get(pk=criterion_id)

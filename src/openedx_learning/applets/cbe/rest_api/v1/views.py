@@ -4,6 +4,7 @@ Views for the CBE REST API, v1.
 from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError
 from django.db.models import QuerySet
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
@@ -284,20 +285,14 @@ class CompetencyCriterionDeleteView(generics.GenericAPIView):
     oel_tagging.can_tag_object itself and raises Django's PermissionDenied, which becomes a 403.
     """
 
-    serializer_class = CompetencyCriterionSerializer
     authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
     permission_classes = [IsAuthenticated]
 
     def delete(self, request, *args, **kwargs):
         """
-        Resolve the criterion scoped to both path segments, then delegate to the public API, which checks permission.
+        Resolve the criterion scoped to both path segments, then delegate to the public API.
 
-        The URL is scoped by tag_id, not group_id, because the route follows the
-        ``competencies/<tag_id>/criteria/`` family #665 created, and the Studio flow addresses a criterion by
-        tag and criterion id.
-        The lookup deliberately does not filter `archived=False`, so a repeat
-        DELETE against an already-archived row still resolves (200), and a mismatched tag_id or a
-        nonexistent criterion_id both 404 the same way, via this one get_object_or_404 call.
+        Archived rows still resolve, so a repeat DELETE on one returns 200.
         """
         criterion = get_object_or_404(
             CompetencyCriterion, pk=self.kwargs["criterion_id"], group__tag_id=self.kwargs["tag_id"],
@@ -309,4 +304,9 @@ class CompetencyCriterionDeleteView(generics.GenericAPIView):
             raise NotFound() from exc
         except DjangoValidationError as exc:
             raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        except IntegrityError as exc:
+            # ProtectedError is a subclass. A learner's grade write won the race, and a retry archives the criterion.
+            raise CompetencyCriteriaConflict(
+                _("A learner's progress was recorded against this criterion during the delete. Retry the DELETE.")
+            ) from exc
         return Response({"id": result.id, "archived": result.archived}, status=status.HTTP_200_OK)
