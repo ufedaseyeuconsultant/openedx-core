@@ -75,15 +75,23 @@ def test_hard_delete_with_no_status_removes_the_row_and_its_object_tag(
     assert not ObjectTag.objects.filter(id=object_tag.id).exists()
 
 
+@pytest.mark.parametrize("shared_object_tag", [False, True], ids=["own object_tag", "shared object_tag"])
 def test_archive_path_leaves_the_row_and_its_object_tag_in_place(
+    *,
     user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, now: datetime,
+    shared_object_tag: bool,
 ) -> None:
     """
     Deleting a criterion that a learner status row already references archives it instead of
-    hard-deleting it: the row and its object_tag both survive, and archived=True comes back.
+    hard-deleting it: the row and its object_tag both survive, and archived=True comes back. Another
+    criterion on the same object_tag is left in place too.
     """
     group = CompetencyCriteriaGroup.objects.create(tag=tag)
     criterion = _make_criterion(group, object_tag, default_rule_profile)
+    other = None
+    if shared_object_tag:
+        other_group = CompetencyCriteriaGroup.objects.create(tag=tag, parent=group)
+        other = _make_criterion(other_group, object_tag, default_rule_profile)
     StudentCompetencyCriterionStatus.objects.create(
         user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
     )
@@ -94,6 +102,9 @@ def test_archive_path_leaves_the_row_and_its_object_tag_in_place(
     criterion.refresh_from_db()
     assert criterion.archived is True
     assert ObjectTag.objects.filter(id=object_tag.id).exists()
+    if other is not None:
+        other.refresh_from_db()
+        assert other.archived is False
 
 
 def _latest_history_user(model_name: str, pk: int):
@@ -376,8 +387,11 @@ def test_archiving_a_groups_only_criterion_archives_the_group_and_cascades_upwar
         user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
     )
 
-    delete_or_archive_competency_criterion(criterion.id, user)
+    result = delete_or_archive_competency_criterion(criterion.id, user)
 
+    assert result.archived is True
+    criterion.refresh_from_db()
+    assert criterion.archived is True
     leaf.refresh_from_db()
     root.refresh_from_db()
     assert leaf.archived is True
@@ -462,6 +476,7 @@ def test_cascade_stops_at_a_group_that_is_already_archived(
     result = delete_or_archive_competency_criterion(criterion.id, user)
 
     assert result.archived is True
+    assert CompetencyCriteriaGroup.objects.filter(pk__in=[leaf.id, root.id], archived=True).count() == 2
     assert counts == (
         _history_count("HistoricalCompetencyCriteriaGroup", leaf.id),
         _history_count("HistoricalCompetencyCriteriaGroup", root.id),
@@ -531,6 +546,9 @@ def test_delete_leaves_an_emptied_archived_group_that_has_its_own_status(
     root = CompetencyCriteriaGroup.objects.create(tag=tag, archived=True)
     leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root, archived=True)
     criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    # Only a criterion archived by an earlier delete sits under an archived group.
+    criterion.archived = True
+    criterion.save()
     StudentCompetencyCriteriaGroupStatus.objects.create(
         user=user, group=leaf, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
     )

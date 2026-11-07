@@ -408,11 +408,12 @@ def test_grade_write_and_hard_delete_fail_one_side_never_silently_grade_first(
     user,
 ) -> None:
     """
-    A hard delete that races a grade write already holding the criterion fails with ``IntegrityError``.
+    A hard delete that races a grade write already holding the criterion fails, usually with ``IntegrityError``.
 
     The grade's status row holds a lock on the criterion, so the delete waits for the grade to commit and
-    then fails the foreign-key check. Nothing is lost: both rows survive, and a second delete archives the
-    criterion.
+    then fails the foreign-key check. If the grade transaction also writes a ``StudentCompetencyStatus``
+    row, which takes a shared lock on the Tag, the delete can instead lose with MySQL deadlock error 1213.
+    Nothing is lost either way: both rows survive, and a second delete archives the criterion.
     """
     _, criterion = leaf_and_criterion
     grade_reached, grade_release = threading.Event(), threading.Event()
@@ -440,10 +441,12 @@ def test_grade_write_and_hard_delete_fail_one_side_never_silently_delete_first(
     user,
 ) -> None:
     """
-    A grade write that races a hard delete already holding the criterion fails with ``IntegrityError``.
+    A grade write that races a hard delete already holding the criterion fails, usually with ``IntegrityError``.
 
-    The grade's status insert waits for the delete to commit and then fails the foreign-key check. The
-    criterion is gone and no status row was written.
+    The grade's status insert waits for the delete to commit and then fails the foreign-key check. If the
+    grade transaction also writes a ``StudentCompetencyStatus`` row, which takes a shared lock on the Tag,
+    the grade can instead lose with MySQL deadlock error 1213. The criterion is gone and no status row was
+    written.
     """
     _, criterion = leaf_and_criterion
     pause = pause_before_the_walk(monkeypatch)

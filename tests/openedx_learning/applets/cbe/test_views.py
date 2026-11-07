@@ -18,6 +18,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from openedx_catalog.models import CatalogCourse, CourseRun
+from openedx_learning.applets.cbe import api as cbe_api
 from openedx_learning.applets.cbe.api import _create_leaf_group
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
@@ -2116,19 +2117,23 @@ def test_tag_id_criterion_id_mismatch_404s(
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
-def test_delete_no_permission_is_403(
-    user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, tag: Tag, group: CompetencyCriteriaGroup,
-    default_rule_profile: CompetencyRuleProfile,
+@pytest.mark.parametrize("lacks", ["object tagging access", "taxonomy view access"])
+def test_delete_without_permission_is_403(
+    *,
+    lacks: str, user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, tag: Tag,
+    group: CompetencyCriteriaGroup, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
 ) -> None:
-    """A caller refused by the object-level tagging rule gets a 403, and the criterion remains."""
+    """A caller refused by the object-level tagging rule, or without view access to the taxonomy, gets a 403."""
+    block_id = UNAUTHORIZED_MARKER if lacks == "object tagging access" else "p1"
     object_tag = ObjectTag.objects.create(
-        object_id=f"block-v1:unused+{UNAUTHORIZED_MARKER}+unused+type@sequential+block@p1",
-        taxonomy=competency_taxonomy,
-        tag=tag,
+        object_id=usage_key(course_run, block_id), taxonomy=competency_taxonomy, tag=tag,
     )
     criterion = CompetencyCriterion.objects.create(
         group=group, object_tag=object_tag, rule_profile=default_rule_profile,
     )
+    if lacks == "taxonomy view access":
+        competency_taxonomy.enabled = False
+        competency_taxonomy.save()
 
     response = user_client.delete(criterion_delete_url(tag.id, criterion.id))
 
@@ -2136,17 +2141,37 @@ def test_delete_no_permission_is_403(
     assert CompetencyCriterion.objects.filter(id=criterion.id).exists()
 
 
-def test_delete_without_view_access_to_the_taxonomy_is_403(
-    user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, criterion: CompetencyCriterion,
+def test_delete_from_an_unidentified_caller_is_401(api_client: APIClient, criterion: CompetencyCriterion) -> None:
+    """A caller the system cannot identify is refused before anything is read, and the criterion remains."""
+    response = api_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert CompetencyCriterion.objects.filter(id=criterion.id).exists()
+
+
+def test_a_grade_that_lands_during_the_delete_is_a_retryable_409(
+    monkeypatch: pytest.MonkeyPatch, user_client: APIClient, user, criterion: CompetencyCriterion, now: datetime,
 ) -> None:
-    """A disabled taxonomy refuses an ordinary caller even when the object id itself is permitted."""
-    competency_taxonomy.enabled = False
-    competency_taxonomy.save()
+    """
+    A learner's status row committed after the delete's progress check makes the delete raise ProtectedError.
+
+    The view answers a 409 that tells the caller to retry, and the criterion is neither deleted nor archived.
+    """
+
+    def progress_arrives_after_the_check(criterion_id: int) -> bool:
+        StudentCompetencyCriterionStatus.objects.create(
+            user=user, criterion_id=criterion_id, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+        )
+        return False
+
+    monkeypatch.setattr(cbe_api, "_criterion_has_learner_progress", progress_arrives_after_the_check)
 
     response = user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
 
-    assert response.status_code == status.HTTP_403_FORBIDDEN
-    assert CompetencyCriterion.objects.filter(id=criterion.id).exists()
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert "Retry the DELETE" in str(response.data["detail"])
+    criterion.refresh_from_db()
+    assert criterion.archived is False
 
 
 def test_delete_of_a_criterion_gone_by_the_time_of_the_call_is_404(
