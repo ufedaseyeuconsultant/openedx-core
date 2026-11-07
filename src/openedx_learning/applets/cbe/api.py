@@ -960,7 +960,7 @@ def _archive_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
     group.save(update_fields=["archived"])
 
 
-def _cascade_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
+def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
     """
     Walk ``group`` and its ancestors, deleting or archiving any left with no live children.
 
@@ -978,7 +978,7 @@ def _cascade_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
         _set_history_user(group, user)
         group.delete()
         if parent is not None:
-            _cascade_from_group(parent, user)
+            _cascade_remove_from_group(parent, user)
         return
     has_live_child = (
         group.criteria.filter(archived=False).exists() or group.child_groups.filter(archived=False).exists()
@@ -995,7 +995,7 @@ def _cascade_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
         # Only archived children remain.
         _archive_group(group, user)
     if parent is not None:
-        _cascade_from_group(parent, user)
+        _cascade_remove_from_group(parent, user)
 
 
 def _archive_criterion(criterion: CompetencyCriterion, user: UserType) -> None:
@@ -1009,7 +1009,7 @@ def _archive_criterion(criterion: CompetencyCriterion, user: UserType) -> None:
     criterion.archived = True
     _set_history_user(criterion, user)
     criterion.save(update_fields=["archived"])
-    _cascade_from_group(criterion.group, user)
+    _cascade_remove_from_group(criterion.group, user)
 
 
 def _criterion_has_learner_progress(criterion_id: int) -> bool:
@@ -1098,5 +1098,5 @@ def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) ->
         # Only this criterion's own ObjectTag is a candidate, and only while no other criterion uses it.
         if not CompetencyCriterion.objects.filter(object_tag_id=object_tag.id).exists():
             ObjectTag.objects.filter(pk=object_tag.id).delete()
-        _cascade_from_group(group, user)
+        _cascade_remove_from_group(group, user)
         return CriterionDeletionResult(id=criterion_id, archived=False)

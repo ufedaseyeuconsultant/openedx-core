@@ -29,7 +29,7 @@ from openedx_learning.api import (
     update_competency_criteria_group,
 )
 from openedx_learning.applets.cbe import api as cbe_api
-from openedx_learning.applets.cbe.api import _cascade_from_group, _create_leaf_group
+from openedx_learning.applets.cbe.api import _cascade_remove_from_group, _create_leaf_group
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -155,7 +155,7 @@ def pause_before_the_walk(monkeypatch: pytest.MonkeyPatch) -> PausePoint:
     The walk calls itself at every level, so only its first call pauses.
     """
     pause = PausePoint()
-    monkeypatch.setattr(cbe_api, "_cascade_from_group", pause.wrap(_cascade_from_group))
+    monkeypatch.setattr(cbe_api, "_cascade_remove_from_group", pause.wrap(_cascade_remove_from_group))
     return pause
 
 

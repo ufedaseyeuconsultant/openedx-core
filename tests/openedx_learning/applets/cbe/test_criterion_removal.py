@@ -1,4 +1,4 @@
-"""Tests for delete_or_archive_competency_criterion() and its ancestor-cascade helper, _cascade_from_group()."""
+"""Tests for delete_or_archive_competency_criterion() and its ancestor-cascade helper, _cascade_remove_from_group()."""
 from collections.abc import Iterator
 from datetime import datetime
 
