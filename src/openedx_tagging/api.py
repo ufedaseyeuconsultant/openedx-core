@@ -459,6 +459,9 @@ def tag_object(
 
     Re-applying a tag whose association is archived un-archives that same row and leaves ``deletion_locked``
     unchanged. Omitted associations that are locked (``deletion_locked=True``) are archived instead of deleted.
+    Omitted associations that are archived, or whose tag or taxonomy is archived (the ones
+    :meth:`ObjectTagQuerySet.unarchived` excludes), are left alone, because a caller that builds its list from the
+    filtered read paths never saw them.
     """
     if not isinstance(tags, list):
         raise ValueError(_("Tags must be a list, not {type}.").format(type=type(tags).__name__))
@@ -523,7 +526,15 @@ def tag_object(
                     )
                     updated_tags.append(object_tag)
 
-    _save_object_tags(current_tags, unarchive_pks, updated_tags)
+    # The read paths hide a row that is archived, or whose tag or taxonomy is archived, so a caller that builds its
+    # list from them never saw such a row, and removing it would delete or re-archive something the caller can't see.
+    # Only the rows that `unarchived()` returns are removed. A row hidden for another reason, such as a disabled
+    # taxonomy, is still removed.
+    active_pks = set(
+        ObjectTag.objects.filter(pk__in=[t.pk for t in current_tags]).unarchived().values_list("pk", flat=True)
+    )
+    removed_tags = [t for t in current_tags if t.pk in active_pks]
+    _save_object_tags(removed_tags, unarchive_pks, updated_tags)
 
 
 def add_tag_to_taxonomy(
