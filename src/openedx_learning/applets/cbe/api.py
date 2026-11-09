@@ -1012,6 +1012,27 @@ def _archive_criterion(criterion: CompetencyCriterion, user: UserType) -> None:
     _cascade_remove_from_group(criterion.group, user)
 
 
+def _reconcile_object_tags(candidate_object_tag_ids: Iterable[int]) -> None:
+    """
+    Delete every ``ObjectTag`` in ``candidate_object_tag_ids`` that no ``CompetencyCriterion`` references.
+
+    An id that any criterion references, archived or not, is left alone: deleting the ``ObjectTag``
+    cascades into that criterion, and an archived criterion may still have learner status rows, which
+    are ``PROTECT``. An id whose row is already gone is skipped.
+
+    A criterion create that reuses a candidate ``ObjectTag`` and commits between the reference check and
+    the delete would have its criterion cascaded away, so callers that can race with a create hold the
+    competency's ``Tag`` row lock.
+    """
+    candidates = set(candidate_object_tag_ids)
+    if not candidates:
+        return
+    referenced = set(
+        CompetencyCriterion.objects.filter(object_tag_id__in=candidates).values_list("object_tag_id", flat=True)
+    )
+    ObjectTag.objects.filter(pk__in=candidates - referenced).delete()
+
+
 def _criterion_has_learner_progress(criterion_id: int) -> bool:
     """Return whether a learner status row references ``criterion_id``."""
     return StudentCompetencyCriterionStatus.objects.filter(criterion_id=criterion_id).exists()
@@ -1096,7 +1117,6 @@ def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) ->
         _set_history_user(criterion, user)
         criterion.delete()
         # Only this criterion's own ObjectTag is a candidate, and only while no other criterion uses it.
-        if not CompetencyCriterion.objects.filter(object_tag_id=object_tag.id).exists():
-            ObjectTag.objects.filter(pk=object_tag.id).delete()
+        _reconcile_object_tags({object_tag.id})
         _cascade_remove_from_group(group, user)
         return CriterionDeletionResult(id=criterion_id, archived=False)

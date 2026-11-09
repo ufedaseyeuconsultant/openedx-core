@@ -10,6 +10,7 @@ from django.core.exceptions import PermissionDenied
 from rules.permissions import permissions as rule_permissions
 
 from openedx_learning.api import delete_or_archive_competency_criterion
+from openedx_learning.applets.cbe.api import _reconcile_object_tags
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -557,3 +558,43 @@ def test_delete_leaves_an_emptied_archived_group_that_has_its_own_status(
 
     assert result.archived is False
     assert CompetencyCriteriaGroup.objects.filter(pk__in=[leaf.id, root.id], archived=True).count() == 2
+
+
+# =================================================================================================
+# _reconcile_object_tags()
+# =================================================================================================
+
+
+def test_reconcile_object_tags_removes_only_unreferenced_rows(
+    competency_taxonomy: CompetencyTaxonomy,
+    tag: Tag,
+    object_tag: ObjectTag,
+    default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """Of three candidate ids: one still referenced stays, one orphan goes, one that never existed is skipped."""
+    orphan = _make_object_tag(competency_taxonomy, tag, "block-v1:Org1+Python100+Fall2026+problem+orphan")
+    _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile)
+    missing_id = orphan.id + 1000
+
+    _reconcile_object_tags({object_tag.id, orphan.id, missing_id})
+
+    assert ObjectTag.objects.filter(id=object_tag.id).exists()
+    assert not ObjectTag.objects.filter(id=orphan.id).exists()
+
+
+def test_reconcile_object_tags_keeps_a_row_only_an_archived_criterion_references(
+    tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """An archived criterion still counts as a reference until #779 can archive the association instead."""
+    criterion = _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile)
+    criterion.archived = True
+    criterion.save(update_fields=["archived"])
+
+    _reconcile_object_tags({object_tag.id})
+
+    assert ObjectTag.objects.filter(id=object_tag.id).exists()
+
+
+def test_reconcile_object_tags_with_no_candidates_touches_nothing(object_tag: ObjectTag) -> None:
+    _reconcile_object_tags(set())
+    assert ObjectTag.objects.filter(id=object_tag.id).exists()
