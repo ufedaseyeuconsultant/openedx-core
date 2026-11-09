@@ -155,7 +155,7 @@ def _course_group_deleted(instance: CompetencyCriteriaGroup, origin=None, **kwar
     except OperationalError:
         raise
     except Exception:  # pylint: disable=broad-exception-caught
-        # Same reasoning as in _clean_up_from(): the course deletion must stand.
+        # As in _clean_up_from(), a failure here must not roll back the course deletion that triggered the signal.
         log.warning(
             "Group cleanup failed after %s; ObjectTags left in place: %s",
             trigger,

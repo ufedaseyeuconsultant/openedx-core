@@ -15,5 +15,5 @@ class LearningConfig(AppConfig):
     label = "openedx_learning"
 
     def ready(self):
-        # Import signal handlers so Django registers all @receiver callbacks.
+        # Importing the module registers its @receiver callbacks.
         from .applets.cbe import signal_handlers  # pylint: disable=unused-import,import-outside-toplevel
