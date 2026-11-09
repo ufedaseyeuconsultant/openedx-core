@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 
 import pytest
 import rules
+from django.db import OperationalError
 from rules.permissions import permissions as rule_permissions
 
 from openedx_catalog.models import CourseRun
@@ -363,3 +364,45 @@ def test_archiving_the_last_live_leaf_archives_every_ancestor_up_to_the_root(
         f"Group cleanup archived CompetencyCriteriaGroup {course_level.pk} after {trigger}",
         f"Group cleanup archived CompetencyCriteriaGroup {root.pk} after {trigger}",
     ]
+
+
+def test_a_helper_failure_leaves_the_groups_warns_and_lets_the_delete_finish(
+    *, tag, course_run, object_tag, default_rule_profile, monkeypatch, caplog,
+) -> None:
+    """A failure inside the walk keeps every group, logs one warning with the traceback, and the delete completes."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(signal_handlers, "_cascade_remove_from_group", _boom)
+
+    with caplog.at_level(logging.WARNING, logger=signal_handlers.__name__):
+        delete_object_tags(object_tag.object_id)
+
+    assert not CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
+    assert CompetencyCriteriaGroup.objects.filter(pk__in=[root.pk, course_level.pk, leaf.pk]).count() == 3
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"Group cleanup failed after CompetencyCriterion {criterion.pk} deleted with ObjectTag {object_tag.pk}; "
+        f"CompetencyCriteriaGroups left in place: {sorted([leaf.pk, course_level.pk, root.pk])}"
+    )
+    assert record.exc_info is not None
+
+
+def test_a_lock_error_is_not_swallowed(
+    *, tag, course_run, object_tag, default_rule_profile, monkeypatch,
+) -> None:
+    """A database OperationalError, such as a MySQL deadlock, propagates out of the delete."""
+    _, _, leaf = _tree(tag, course_run)
+    _make_criterion(leaf, object_tag, default_rule_profile)
+
+    def _deadlock(*_args, **_kwargs):
+        raise OperationalError("Deadlock found")
+
+    monkeypatch.setattr(signal_handlers, "_cascade_remove_from_group", _deadlock)
+
+    with pytest.raises(OperationalError):
+        delete_object_tags(object_tag.object_id)
