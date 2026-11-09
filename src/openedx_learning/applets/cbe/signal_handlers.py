@@ -7,9 +7,11 @@ and the course-level group and root above it, are then left with nothing under t
 here walk that lineage and delete or archive each group the same way
 ``delete_or_archive_competency_criterion()`` does.
 
-The receivers react only to a delete whose origin is an ``ObjectTag``, as an instance or as a
-queryset. A criterion deleted for any other reason, including by ``delete_or_archive_competency_criterion()``
-itself, is handled by whoever deleted it.
+The receivers react only to a delete whose origin is an ``ObjectTag`` or a ``CourseRun``, as an instance or
+as a queryset. Deleting a ``CourseRun`` cascades to its course-level groups, which leaves the shared root
+without a course beneath it and the ``ObjectTag`` of each deleted criterion possibly unused. A criterion
+deleted for any other reason, including by ``delete_or_archive_competency_criterion()`` itself, is handled
+by whoever deleted it.
 
 The receivers never roll back the deletion that triggered them: a failure while cleaning up is logged
 and the groups stay in place. They also add no knowledge of CBE to ``openedx_tagging``; the dependency
@@ -19,13 +21,14 @@ import logging
 from collections.abc import Callable
 
 from django.db import OperationalError, transaction
-from django.db.models import Model, QuerySet
-from django.db.models.signals import post_delete
+from django.db.models import Model, Q, QuerySet
+from django.db.models.signals import post_delete, pre_delete
 from django.dispatch import receiver
 
+from openedx_catalog.models_api import CourseRun
 from openedx_tagging.models import ObjectTag, Tag
 
-from .api import _cascade_remove_from_group
+from .api import _cascade_remove_from_group, _reconcile_object_tags
 from .models import CompetencyCriteriaGroup, CompetencyCriterion
 
 log = logging.getLogger(__name__)
@@ -110,3 +113,48 @@ def _criterion_deleted(instance: CompetencyCriterion, origin=None, **kwargs) -> 
         instance.group_id,
         f"CompetencyCriterion {instance.pk} deleted with ObjectTag {instance.object_tag_id}",
     )
+
+
+@receiver(pre_delete, sender=CompetencyCriteriaGroup)
+def _course_group_about_to_be_deleted(instance: CompetencyCriteriaGroup, origin=None, **kwargs) -> None:
+    """
+    Remember which ``ObjectTag`` ids a course-level group's criteria use, before they are deleted.
+
+    Django deletes the criteria before the groups, so ``post_delete`` can no longer read them.
+    Django passes the same instance object to both signals, so the ids are kept on it.
+    """
+    if not _is_delete_of(origin, CourseRun) or instance.course_id is None:
+        return
+    instance._cleanup_object_tag_ids = set(  # type: ignore[attr-defined]  # pylint: disable=protected-access
+        CompetencyCriterion.objects.filter(Q(group_id=instance.pk) | Q(group__parent_id=instance.pk)).values_list(
+            "object_tag_id", flat=True
+        )
+    )
+
+
+@receiver(post_delete, sender=CompetencyCriteriaGroup)
+def _course_group_deleted(instance: CompetencyCriteriaGroup, origin=None, **kwargs) -> None:
+    """
+    Clean up the root above a course-level group deleted with its ``CourseRun``, and the tags its criteria used.
+
+    The two steps are independent and best-effort. Reconciling runs even when the root is already gone, which
+    happens when two runs under one root are deleted together: each course-level group stashed only its own ids.
+    """
+    if not _is_delete_of(origin, CourseRun) or instance.course_id is None or instance.parent_id is None:
+        return
+    trigger = f"CompetencyCriteriaGroup {instance.pk} deleted with CourseRun {instance.course_id}"
+    _clean_up_from(instance.parent_id, trigger)
+    stashed_ids: set[int] = getattr(instance, "_cleanup_object_tag_ids", set())
+    try:
+        with transaction.atomic():
+            _reconcile_object_tags(stashed_ids)
+    except OperationalError:
+        raise
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Same reasoning as in _clean_up_from(): the course deletion must stand.
+        log.warning(
+            "Group cleanup failed after %s; ObjectTags left in place: %s",
+            trigger,
+            sorted(stashed_ids),
+            exc_info=True,
+        )
