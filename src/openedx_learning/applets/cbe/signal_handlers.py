@@ -140,12 +140,16 @@ def _course_group_deleted(instance: CompetencyCriteriaGroup, origin=None, **kwar
     The two steps are independent and best-effort. Reconciling runs even when the root is already gone, which
     happens when two runs under one root are deleted together: each course-level group stashed only its own ids.
     """
-    if not _is_delete_of(origin, CourseRun) or instance.course_id is None or instance.parent_id is None:
+    if not _is_delete_of(origin, CourseRun) or instance.course_id is None:
         return
     trigger = f"CompetencyCriteriaGroup {instance.pk} deleted with CourseRun {instance.course_id}"
-    _clean_up_from(instance.parent_id, trigger)
+    if instance.parent_id is not None:
+        _clean_up_from(instance.parent_id, trigger)
     stashed_ids: set[int] = getattr(instance, "_cleanup_object_tag_ids", set())
     try:
+        # No Tag row lock is held here, unlike in _clean_up_from(). The criteria that referenced these ids were
+        # just cascaded away by the CourseRun delete, and a concurrent create would reference the ObjectTag
+        # through a new criterion, which the reconcile's "still referenced" check already respects.
         with transaction.atomic():
             _reconcile_object_tags(stashed_ids)
     except OperationalError:

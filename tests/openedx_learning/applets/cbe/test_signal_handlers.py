@@ -622,3 +622,19 @@ def test_a_failed_tag_reconcile_warns_keeps_the_object_tags_and_lets_the_delete_
     assert record.levelno == logging.WARNING
     assert record.getMessage().endswith(f"; ObjectTags left in place: [{object_tag.pk}]")
     assert record.exc_info is not None
+
+
+def test_a_course_group_with_no_parent_still_reconciles_its_object_tags(
+    *, tag, course_run, object_tag, default_rule_profile, caplog,
+) -> None:
+    """With no root above it there is nothing to walk, but the ObjectTags its criteria used are still removed."""
+    course_level = CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run)
+    leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_level)
+    _make_criterion(leaf, object_tag, default_rule_profile)
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        course_run.delete()
+
+    assert not CompetencyCriteriaGroup.objects.filter(pk__in=[course_level.pk, leaf.pk]).exists()
+    assert not ObjectTag.objects.filter(pk=object_tag.pk).exists()
+    assert _cleanup_lines(caplog) == []
