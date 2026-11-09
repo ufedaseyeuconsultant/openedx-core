@@ -13,3 +13,7 @@ class LearningConfig(AppConfig):
     verbose_name = "Open edX Core > Learning"
     default_auto_field = "django.db.models.BigAutoField"
     label = "openedx_learning"
+
+    def ready(self):
+        # Import signal handlers so Django registers all @receiver callbacks.
+        from .applets.cbe import signal_handlers  # pylint: disable=unused-import,import-outside-toplevel
