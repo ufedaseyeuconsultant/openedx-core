@@ -18,7 +18,6 @@ and the groups stay in place. They also add no knowledge of CBE to ``openedx_tag
 points the other way, from this applet to the tagging models.
 """
 import logging
-from collections.abc import Callable
 
 from django.db import OperationalError, transaction
 from django.db.models import Model, Q, QuerySet
@@ -58,11 +57,11 @@ def _lineage_state(group: CompetencyCriteriaGroup) -> dict[int, bool]:
     return state
 
 
-def _clean_up_from(group_id: int, trigger: str, extra: Callable[[], None] | None = None) -> None:
+def _clean_up_from(group_id: int, trigger: str) -> None:
     """
     Walk up from ``group_id``, deleting or archiving each group left with no live children, and log the outcome.
 
-    Does nothing if the group is already gone. ``extra`` runs in the same transaction, after the walk.
+    Does nothing if the group is already gone.
     Any failure other than a database ``OperationalError`` is logged and swallowed.
     """
     group = CompetencyCriteriaGroup.objects.select_related("parent__parent").filter(pk=group_id).first()
@@ -80,8 +79,6 @@ def _clean_up_from(group_id: int, trigger: str, extra: Callable[[], None] | None
                 return
             before = _lineage_state(group)
             _cascade_remove_from_group(group, None)
-            if extra is not None:
-                extra()
     except OperationalError:
         # A MySQL deadlock has already rolled back the whole transaction, so swallowing it would only move
         # the error to the next statement.
@@ -147,10 +144,11 @@ def _course_group_deleted(instance: CompetencyCriteriaGroup, origin=None, **kwar
         _clean_up_from(instance.parent_id, trigger)
     stashed_ids: set[int] = getattr(instance, "_cleanup_object_tag_ids", set())
     try:
-        # No Tag row lock is held here, unlike in _clean_up_from(). The criteria that referenced these ids were
-        # just cascaded away by the CourseRun delete, and a concurrent create would reference the ObjectTag
-        # through a new criterion, which the reconcile's "still referenced" check already respects.
         with transaction.atomic():
+            # The same lock, for the same three races, as delete_or_archive_competency_criterion(); see its comment.
+            # The walk above may have returned before taking it, so it is taken here too. Taking it again when the
+            # walk already holds it is harmless.
+            Tag.objects.select_for_update().filter(pk=instance.tag_id).first()
             _reconcile_object_tags(stashed_ids)
     except OperationalError:
         raise

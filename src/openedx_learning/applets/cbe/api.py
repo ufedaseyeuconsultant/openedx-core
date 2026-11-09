@@ -737,9 +737,9 @@ def bulk_update_competency_criteria(
         _validate_rule_source(rule_profile_id, rule_type_override, rule_payload_override)
 
         # Every CBE authoring writer of a competency's criteria takes its Tag row lock first and no other row lock
-        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag, a Taxonomy
-        # or a CourseRun take the Tag row last, and can deadlock with a create or a hard delete: one side fails
-        # with a MySQL 1213 error and no data is corrupted. Everything below reads committed state, since a
+        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag, a Taxonomy,
+        # a CourseRun or an ObjectTag take the Tag row last, and can deadlock with a create or a hard delete: one
+        # side fails with a MySQL 1213 error and no data is corrupted. Everything below reads committed state, since a
         # delete, an archive or a create for this competency can't commit while this transaction holds the lock.
         # The reads above are safe without it because a group's tag, parent and course never change.
         Tag.objects.select_for_update().get(pk=group.tag_id)

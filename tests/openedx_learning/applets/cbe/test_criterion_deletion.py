@@ -105,7 +105,7 @@ def test_object_tag_delete_removes_the_criteria_group_it_leaves_empty(
     """
     Deleting an ObjectTag cascades away the CompetencyCriterion that references it. CompetencyCriteriaGroup
     has no foreign key to ObjectTag, so Django's collector never reaches the group; the post_delete receiver
-    in signal_handlers.py removes the group, and its empty ancestors, instead.
+    in signal_handlers.py removes the group instead.
     """
     criterion = CompetencyCriterion.objects.create(
         group=group, object_tag=object_tag, rule_profile=default_rule_profile

@@ -127,7 +127,8 @@ def test_queryset_origin_removes_both_leaves_the_course_group_and_the_root(
     group_ids = [root.pk, course_level.pk, leaf_1.pk, leaf_2.pk]
     assert not CompetencyCriteriaGroup.objects.filter(pk__in=group_ids).exists()
     lines = _cleanup_lines(caplog)
-    # The collector's order of post_delete calls differs between database vendors.
+    # The order of post_delete calls within a batch is an implementation detail of Django's collector, so
+    # the test compares sets.
     assert len(lines) == 4
     assert all(line.startswith("Group cleanup removed CompetencyCriteriaGroup ") for line in lines)
     assert set(_ids_named_in(lines)) == set(group_ids)
@@ -208,7 +209,7 @@ def _delete_tag(criterion, _user):
 
 
 def _delete_taxonomy(criterion, _user):
-    """Delete the taxonomy, which cascades to its tags, object tags and criteria."""
+    """Delete the taxonomy, which cascades to its tags and criteria groups and nulls the object tags' taxonomy."""
     criterion.object_tag.taxonomy.delete()
 
 
@@ -622,6 +623,51 @@ def test_a_failed_tag_reconcile_warns_keeps_the_object_tags_and_lets_the_delete_
     assert record.levelno == logging.WARNING
     assert record.getMessage().endswith(f"; ObjectTags left in place: [{object_tag.pk}]")
     assert record.exc_info is not None
+
+
+def test_a_helper_failure_on_a_course_run_delete_warns_and_lets_the_delete_finish(
+    *, tag, course_run, object_tag, default_rule_profile, monkeypatch, caplog,
+) -> None:
+    """A failing walk keeps the root, the course delete cascades as usual, and the ObjectTag cleanup still runs."""
+    root, course_level, leaf = _tree(tag, course_run)
+    _make_criterion(leaf, object_tag, default_rule_profile)
+    course_run_pk = course_run.pk
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(signal_handlers, "_cascade_remove_from_group", _boom)
+
+    with caplog.at_level(logging.WARNING, logger=signal_handlers.__name__):
+        course_run.delete()
+
+    assert not CourseRun.objects.filter(pk=course_run_pk).exists()
+    assert CompetencyCriteriaGroup.objects.filter(pk=root.pk).exists()
+    assert not CompetencyCriteriaGroup.objects.filter(pk__in=[course_level.pk, leaf.pk]).exists()
+    assert not ObjectTag.objects.filter(pk=object_tag.pk).exists()
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"Group cleanup failed after CompetencyCriteriaGroup {course_level.pk} deleted with CourseRun "
+        f"{course_run_pk}; CompetencyCriteriaGroups left in place: [{root.pk}]"
+    )
+    assert record.exc_info is not None
+
+
+def test_a_lock_error_in_the_tag_cleanup_is_not_swallowed(
+    *, tag, course_run, object_tag, default_rule_profile, monkeypatch,
+) -> None:
+    """A database OperationalError raised by the ObjectTag cleanup propagates out of the course delete."""
+    _, _, leaf = _tree(tag, course_run)
+    _make_criterion(leaf, object_tag, default_rule_profile)
+
+    def _deadlock(*_args, **_kwargs):
+        raise OperationalError("Deadlock found")
+
+    monkeypatch.setattr(signal_handlers, "_reconcile_object_tags", _deadlock)
+
+    with pytest.raises(OperationalError):
+        course_run.delete()
 
 
 def test_a_course_group_with_no_parent_still_reconciles_its_object_tags(
