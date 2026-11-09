@@ -14,6 +14,8 @@ from openedx_learning.models import (
     CompetencyCriterion,
     CompetencyRuleProfile,
     CompetencyTaxonomy,
+    MasteryStatus,
+    StudentCompetencyCriteriaGroupStatus,
 )
 from openedx_tagging.api import delete_object_tags, tag_object
 from openedx_tagging.models import ObjectTag, Tag
@@ -220,7 +222,7 @@ def _delete_taxonomy(criterion, _user):
 def test_other_origins_never_run_the_walk_or_log(
     make_delete: Callable, *, user, tag, course_run, object_tag, default_rule_profile, caplog, monkeypatch,
 ) -> None:
-    """A criterion that goes away for any reason but its ObjectTag's deletion leaves the groups alone."""
+    """A criterion that goes away for any reason but its ObjectTag's deletion never makes the receiver walk or log."""
     _, _, leaf = _tree(tag, course_run)
     criterion = _make_criterion(leaf, object_tag, default_rule_profile)
 
@@ -232,4 +234,132 @@ def test_other_origins_never_run_the_walk_or_log(
         make_delete(criterion, user)
 
     # The receiver would turn the AssertionError into a warning line, so no line means the walk never ran.
+    assert not CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
     assert _cleanup_lines(caplog) == []
+
+
+OTHER_OBJECT_ID = "block-v1:Org1+Python100+Fall2026+problem+p2"
+
+
+def _archived(group: CompetencyCriteriaGroup) -> bool:
+    """Return the group's archived flag as stored."""
+    return CompetencyCriteriaGroup.objects.get(pk=group.pk).archived
+
+
+def test_a_leaf_that_also_holds_an_archived_criterion_is_archived_not_removed(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
+) -> None:
+    """A leaf still holding an archived criterion is archived; a live sibling leaf keeps the ancestors unchanged."""
+    root, course_level, leaf = _tree(tag, course_run)
+    other_leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_level)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    archived_tag = _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID)
+    archived_criterion = _make_criterion(leaf, archived_tag, default_rule_profile)
+    archived_criterion.archived = True
+    archived_criterion.save(update_fields=["archived"])
+    live_tag = _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID + "2")
+    _make_criterion(other_leaf, live_tag, default_rule_profile)
+    trigger = f"CompetencyCriterion {criterion.pk} deleted with ObjectTag {object_tag.pk}"
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        delete_object_tags(object_tag.object_id)
+
+    assert _archived(leaf) is True
+    assert [_archived(g) for g in (course_level, root, other_leaf)] == [False, False, False]
+    assert _cleanup_lines(caplog) == [f"Group cleanup archived CompetencyCriteriaGroup {leaf.pk} after {trigger}"]
+
+
+def test_a_leaf_with_its_own_group_status_is_archived(
+    *, user, now, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
+) -> None:
+    """A leaf with a learner group status row is archived instead of removed; a live sibling leaf protects the rest."""
+    root, course_level, leaf = _tree(tag, course_run)
+    other_leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_level)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    _make_criterion(other_leaf, _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID), default_rule_profile)
+    StudentCompetencyCriteriaGroupStatus.objects.create(
+        user=user, group=leaf, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+    trigger = f"CompetencyCriterion {criterion.pk} deleted with ObjectTag {object_tag.pk}"
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        delete_object_tags(object_tag.object_id)
+
+    assert _archived(leaf) is True
+    assert [_archived(g) for g in (course_level, root, other_leaf)] == [False, False, False]
+    assert _cleanup_lines(caplog) == [f"Group cleanup archived CompetencyCriteriaGroup {leaf.pk} after {trigger}"]
+
+
+def test_a_course_group_left_with_only_archived_leaves_is_archived_too(
+    *, tag, course_run, competency_taxonomy, object_tag, default_rule_profile, caplog,
+) -> None:
+    """A course-level group whose remaining leaves are all archived is archived; another course keeps the root."""
+    root, course_level, leaf_y = _tree(tag, course_run)
+    leaf_x = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_level, archived=True)
+    criterion = _make_criterion(leaf_y, object_tag, default_rule_profile)
+    archived_criterion = _make_criterion(
+        leaf_x, _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID), default_rule_profile,
+    )
+    archived_criterion.archived = True
+    archived_criterion.save(update_fields=["archived"])
+    spring_run = CourseRun.objects.create(catalog_course=course_run.catalog_course, run_code="Spring2027")
+    spring_level = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root, course=spring_run)
+    spring_leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=spring_level)
+    _make_criterion(
+        spring_leaf, _make_object_tag(competency_taxonomy, tag, OTHER_OBJECT_ID + "2"), default_rule_profile,
+    )
+    trigger = f"CompetencyCriterion {criterion.pk} deleted with ObjectTag {object_tag.pk}"
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        delete_object_tags(object_tag.object_id)
+
+    assert not CompetencyCriteriaGroup.objects.filter(pk=leaf_y.pk).exists()
+    assert _archived(course_level) is True
+    assert [_archived(g) for g in (root, spring_level, spring_leaf)] == [False, False, False]
+    assert _cleanup_lines(caplog) == [
+        f"Group cleanup removed CompetencyCriteriaGroup {leaf_y.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {course_level.pk} after {trigger}",
+    ]
+
+
+def test_an_archived_leaf_losing_its_last_criterion_is_removed_and_logged_as_removed(
+    *, tag, course_run, object_tag, default_rule_profile, caplog,
+) -> None:
+    """An already-archived leaf with no status row is deleted, and so is every group above it left empty."""
+    root, course_level, leaf = _tree(tag, course_run)
+    leaf.archived = True
+    leaf.save(update_fields=["archived"])
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    trigger = f"CompetencyCriterion {criterion.pk} deleted with ObjectTag {object_tag.pk}"
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        delete_object_tags(object_tag.object_id)
+
+    assert not CompetencyCriteriaGroup.objects.filter(pk__in=[root.pk, course_level.pk, leaf.pk]).exists()
+    assert _cleanup_lines(caplog) == [
+        f"Group cleanup removed CompetencyCriteriaGroup {leaf.pk} after {trigger}",
+        f"Group cleanup removed CompetencyCriteriaGroup {course_level.pk} after {trigger}",
+        f"Group cleanup removed CompetencyCriteriaGroup {root.pk} after {trigger}",
+    ]
+
+
+def test_archiving_the_last_live_leaf_archives_every_ancestor_up_to_the_root(
+    *, user, now, tag, course_run, object_tag, default_rule_profile, caplog,
+) -> None:
+    """With no live group left anywhere beneath them, the course-level group and the root are archived too."""
+    root, course_level, leaf = _tree(tag, course_run)
+    criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    StudentCompetencyCriteriaGroupStatus.objects.create(
+        user=user, group=leaf, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+    trigger = f"CompetencyCriterion {criterion.pk} deleted with ObjectTag {object_tag.pk}"
+
+    with caplog.at_level(logging.INFO, logger=signal_handlers.__name__):
+        delete_object_tags(object_tag.object_id)
+
+    assert [_archived(g) for g in (leaf, course_level, root)] == [True, True, True]
+    assert _cleanup_lines(caplog) == [
+        f"Group cleanup archived CompetencyCriteriaGroup {leaf.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {course_level.pk} after {trigger}",
+        f"Group cleanup archived CompetencyCriteriaGroup {root.pk} after {trigger}",
+    ]
