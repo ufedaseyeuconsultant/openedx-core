@@ -10,7 +10,7 @@ from django.core.exceptions import PermissionDenied
 from rules.permissions import permissions as rule_permissions
 
 from openedx_learning.api import delete_or_archive_competency_criterion
-from openedx_learning.applets.cbe.api import _reconcile_object_tags
+from openedx_learning.applets.cbe.api import _cascade_remove_from_group, _reconcile_object_tags
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -598,3 +598,17 @@ def test_reconcile_object_tags_keeps_a_row_only_an_archived_criterion_references
 def test_reconcile_object_tags_with_no_candidates_touches_nothing(object_tag: ObjectTag) -> None:
     _reconcile_object_tags(set())
     assert ObjectTag.objects.filter(id=object_tag.id).exists()
+
+
+def test_cascade_with_no_user_records_a_history_row_with_no_author(tag: Tag) -> None:
+    """A cascade that no person caused writes its archive history row with a null history_user."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    archived_child = CompetencyCriteriaGroup.objects.create(tag=tag, parent=leaf, archived=True)
+
+    _cascade_remove_from_group(leaf, None)
+
+    leaf.refresh_from_db()
+    assert leaf.archived is True
+    assert _latest_history_user("HistoricalCompetencyCriteriaGroup", leaf.id) is None
+    assert CompetencyCriteriaGroup.objects.filter(pk=archived_child.pk).exists()

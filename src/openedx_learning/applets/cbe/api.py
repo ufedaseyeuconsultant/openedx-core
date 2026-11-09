@@ -641,8 +641,12 @@ def _validate_rule_source(
         raise ValidationError(errors) from exc
 
 
-def _set_history_user(instance: Any, user: UserType) -> None:
-    """Record ``user`` as the author of ``instance``'s next history row; API callers have no request middleware."""
+def _set_history_user(instance: Any, user: UserType | None) -> None:
+    """
+    Record ``user`` as the author of ``instance``'s next history row; API callers have no request middleware.
+
+    ``None`` records a change no person caused, such as a cascade from a content or course deletion.
+    """
     instance._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
 
 
@@ -953,14 +957,14 @@ def update_competency_criteria_group(
         return group
 
 
-def _archive_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
+def _archive_group(group: CompetencyCriteriaGroup, user: UserType | None) -> None:
     """Archive ``group``, writing only the flag and recording ``user`` in its history."""
     group.archived = True
     _set_history_user(group, user)
     group.save(update_fields=["archived"])
 
 
-def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
+def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType | None) -> None:
     """
     Walk ``group`` and its ancestors, deleting or archiving any left with no live children.
 
@@ -998,7 +1002,7 @@ def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType) -
         _cascade_remove_from_group(parent, user)
 
 
-def _archive_criterion(criterion: CompetencyCriterion, user: UserType) -> None:
+def _archive_criterion(criterion: CompetencyCriterion, user: UserType | None) -> None:
     """
     Archive ``criterion`` in place and cascade the archive to any ancestor left with no live children.
 
