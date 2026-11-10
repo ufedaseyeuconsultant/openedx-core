@@ -290,7 +290,7 @@ class CompetencyCriterionDeleteView(generics.GenericAPIView):
 
     def delete(self, request, *args, **kwargs):
         """
-        Resolve the criterion scoped to both path segments, then delegate to the public API.
+        Resolve the criterion by the `criterion_id` and `tag_id` in the URL, then delegate to the public API.
 
         Archived rows still resolve, so a repeat DELETE on one returns 200.
         """
