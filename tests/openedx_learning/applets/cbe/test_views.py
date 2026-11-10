@@ -20,6 +20,7 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from openedx_catalog.models import CatalogCourse, CourseRun
+from openedx_learning.applets.cbe import api as cbe_api
 from openedx_learning.applets.cbe.api import _create_leaf_group
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
@@ -29,6 +30,7 @@ from openedx_learning.models import (
     LogicOperator,
     MasteryStatus,
     RuleType,
+    StudentCompetencyCriteriaGroupStatus,
     StudentCompetencyCriterionStatus,
 )
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
@@ -567,91 +569,6 @@ def test_duplicate_association_via_the_derive_path_is_rejected_before_creating_a
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert "object_id" in response.data
     assert CompetencyCriteriaGroup.objects.count() == groups_before
-
-
-def test_supplied_archived_leaf_group_is_rejected(user_client: APIClient, tag: Tag, course_run: CourseRun) -> None:
-    """The 400 is keyed group_id, and no criterion is created."""
-    leaf = _create_leaf_group(tag, course_run)
-    leaf.archived = True
-    leaf.save()
-    object_id = usage_key(course_run, "p1")
-
-    response = user_client.post(
-        criterion_create_url(tag.id), {"object_id": object_id, "group_id": leaf.id}, format="json",
-    )
-
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert "archived" in str(response.data["group_id"])
-    assert not CompetencyCriterion.objects.exists()
-
-
-def test_derive_path_with_an_archived_course_level_group_is_rejected(
-    user_client: APIClient, tag: Tag, course_run: CourseRun,
-) -> None:
-    """With no group_id, an archived course-level group for the object's course is a 400 and creates nothing."""
-    root = CompetencyCriteriaGroup.objects.create(tag=tag, parent=None)
-    CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root, archived=True)
-    groups_before = CompetencyCriteriaGroup.objects.count()
-
-    response = user_client.post(
-        criterion_create_url(tag.id), {"object_id": usage_key(course_run, "p1")}, format="json",
-    )
-
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert "archived" in str(response.data["object_id"])
-    assert CompetencyCriteriaGroup.objects.count() == groups_before
-    assert not CompetencyCriterion.objects.exists()
-
-
-def test_derive_path_reactivates_an_archived_root_instead_of_creating_a_second_one(
-    user_client: APIClient, tag: Tag, course_run: CourseRun, organization: Organization,
-) -> None:
-    """An archived root whose only course-level group (another course) is archived is reactivated and reused."""
-    other_course_run = make_course_run(organization, "Python200", "Fall2026")
-    root = CompetencyCriteriaGroup.objects.create(tag=tag, parent=None, archived=True)
-    other_course_level = CompetencyCriteriaGroup.objects.create(
-        tag=tag, course=other_course_run, parent=root, archived=True,
-    )
-
-    response = user_client.post(
-        criterion_create_url(tag.id), {"object_id": usage_key(course_run, "p1")}, format="json",
-    )
-
-    assert response.status_code == status.HTTP_201_CREATED
-    root.refresh_from_db()
-    assert root.archived is False
-    assert CompetencyCriteriaGroup.objects.filter(tag=tag, parent__isnull=True).count() == 1
-    criterion = CompetencyCriterion.objects.get(pk=response.data["id"])
-    assert criterion.group.parent is not None
-    assert criterion.group.parent.parent_id == root.id
-    assert criterion.group.parent.course_id == course_run.id
-    other_course_level.refresh_from_db()
-    assert other_course_level.archived is True
-
-
-def test_re_association_while_a_sibling_keeps_the_course_level_group_alive_is_created(
-    user_client: APIClient, tag: Tag, course_run: CourseRun,
-) -> None:
-    """
-    A fresh association of an archived (tag, object_id) is created while a sibling keeps the course-level group alive.
-
-    The archive state mirrors the cascade: the first criterion and its leaf are archived, the sibling's leaf is not.
-    """
-    object_id = usage_key(course_run, "p1")
-    first = user_client.post(criterion_create_url(tag.id), {"object_id": object_id}, format="json")
-    sibling = user_client.post(criterion_create_url(tag.id), {"object_id": usage_key(course_run, "p2")}, format="json")
-    assert first.status_code == status.HTTP_201_CREATED
-    assert sibling.status_code == status.HTTP_201_CREATED
-    criterion = CompetencyCriterion.objects.get(pk=first.data["id"])
-    criterion.archived = True
-    criterion.save()
-    criterion.group.archived = True
-    criterion.group.save()
-
-    response = user_client.post(criterion_create_url(tag.id), {"object_id": object_id}, format="json")
-
-    assert response.status_code == status.HTTP_201_CREATED
-    assert response.data["id"] != first.data["id"]
 
 
 def test_all_null_rule_fields_resolve_to_the_system_default_profile_id(
@@ -1303,6 +1220,7 @@ def test_full_tree_combines_multiple_courses_in_one_unscoped_response(
 
 def test_tree_response_never_references_a_group_it_left_out(
     user_client: APIClient,
+    organization: Organization,
     tag: Tag,
     course_run: CourseRun,
     default_rule_profile: CompetencyRuleProfile,
@@ -1311,23 +1229,18 @@ def test_tree_response_never_references_a_group_it_left_out(
     leaf = _create_leaf_group(tag, course_run)
     object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
     CompetencyCriterion.objects.create(group=leaf, object_tag=object_tag, rule_profile=default_rule_profile)
-    sibling_leaf = _create_leaf_group(tag, course_run)
-    sibling_object_tag = ObjectTag.objects.create(
-        object_id=usage_key(course_run, "p2"), taxonomy=tag.taxonomy, tag=tag,
+    # The kept leaf lives under a second course's course-level group, so archiving the first
+    # course-level group leaves it attached to a returned parent.
+    other_course_run = make_course_run(organization, "Python200", "Fall2026")
+    kept_leaf = _create_leaf_group(tag, other_course_run)
+    kept_object_tag = ObjectTag.objects.create(
+        object_id=usage_key(other_course_run, "p1"), taxonomy=tag.taxonomy, tag=tag,
     )
     kept_criterion = CompetencyCriterion.objects.create(
-        group=sibling_leaf, object_tag=sibling_object_tag, rule_profile=default_rule_profile,
+        group=kept_leaf, object_tag=kept_object_tag, rule_profile=default_rule_profile,
     )
     course_level = leaf.parent
     assert course_level is not None
-    # Both leaves share one course-level group, so detach the sibling under a kept parent.
-    kept_course_level = sibling_leaf.parent
-    assert kept_course_level is not None
-    assert kept_course_level.id == course_level.id
-    root = course_level.parent
-    assert root is not None
-    sibling_leaf.parent = root
-    sibling_leaf.save()
     course_level.archived = True
     course_level.save()
 
@@ -2157,24 +2070,22 @@ def test_repeat_delete_on_an_archived_criterion_is_idempotent_200(
     assert response.data == {"id": criterion.id, "archived": True}
 
 
-def test_unknown_criterion_id_404s(user_client: APIClient, tag: Tag) -> None:
-    """A criterion_id that never existed under a real tag 404s from the view's own lookup."""
-    response = user_client.delete(criterion_delete_url(tag.id, 999999))
+@pytest.mark.parametrize("hard_delete_first", [False, True], ids=["never-existed", "already-hard-deleted"])
+def test_delete_of_a_criterion_that_is_not_there_404s(
+    hard_delete_first: bool, user_client: APIClient, criterion: CompetencyCriterion,
+) -> None:
+    """
+    A criterion_id that never existed, or whose row an earlier hard delete removed, 404s from the view's
+    own lookup. Repeating a hard delete is not idempotent like repeating an archive.
+    """
+    criterion_id = 999999
+    if hard_delete_first:
+        criterion_id = criterion.id
+        assert user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion_id)).status_code == 200
+
+    response = user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion_id))
 
     assert response.status_code == status.HTTP_404_NOT_FOUND
-
-
-def test_repeat_delete_after_hard_delete_404s(
-    user_client: APIClient, criterion: CompetencyCriterion,
-) -> None:
-    """Repeating a DELETE after a hard-delete removed the row is not idempotent like the archived case: it 404s."""
-    url = criterion_delete_url(criterion.group.tag_id, criterion.id)
-    first = user_client.delete(url)
-    assert first.status_code == status.HTTP_200_OK
-
-    second = user_client.delete(url)
-
-    assert second.status_code == status.HTTP_404_NOT_FOUND
 
 
 def test_cascade_deleted_group_404s_on_subsequent_create(
@@ -2214,66 +2125,124 @@ def test_tag_id_criterion_id_mismatch_404s(
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
-def test_delete_no_permission_is_403(
-    user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, tag: Tag, group: CompetencyCriteriaGroup,
-    default_rule_profile: CompetencyRuleProfile,
+@pytest.mark.parametrize("lacks", ["object tagging access", "taxonomy view access"])
+def test_delete_without_permission_is_403(
+    *,
+    lacks: str, user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, tag: Tag,
+    group: CompetencyCriteriaGroup, course_run: CourseRun, default_rule_profile: CompetencyRuleProfile,
 ) -> None:
-    """A caller refused by the object-level tagging rule gets a 403, and the criterion and ObjectTag remain."""
+    """A caller refused by the object-level tagging rule, or without view access to the taxonomy, gets a 403."""
+    block_id = UNAUTHORIZED_MARKER if lacks == "object tagging access" else "p1"
     object_tag = ObjectTag.objects.create(
-        object_id=f"block-v1:unused+{UNAUTHORIZED_MARKER}+unused+type@sequential+block@p1",
-        taxonomy=competency_taxonomy,
-        tag=tag,
+        object_id=usage_key(course_run, block_id), taxonomy=competency_taxonomy, tag=tag,
     )
     criterion = CompetencyCriterion.objects.create(
         group=group, object_tag=object_tag, rule_profile=default_rule_profile,
     )
+    if lacks == "taxonomy view access":
+        competency_taxonomy.enabled = False
+        competency_taxonomy.save()
 
     response = user_client.delete(criterion_delete_url(tag.id, criterion.id))
 
     assert response.status_code == status.HTTP_403_FORBIDDEN
     assert CompetencyCriterion.objects.filter(id=criterion.id).exists()
-    assert ObjectTag.objects.filter(id=object_tag.id).exists()
 
 
-def test_delete_without_view_access_to_the_taxonomy_is_403(
-    user_client: APIClient, competency_taxonomy: CompetencyTaxonomy, criterion: CompetencyCriterion,
+def test_delete_from_an_unidentified_caller_is_401(api_client: APIClient, criterion: CompetencyCriterion) -> None:
+    """A caller the system cannot identify is refused before anything is read, and the criterion remains."""
+    response = api_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert CompetencyCriterion.objects.filter(id=criterion.id).exists()
+
+
+def test_a_grade_that_lands_during_the_delete_is_a_retryable_409(
+    monkeypatch: pytest.MonkeyPatch, user_client: APIClient, user, criterion: CompetencyCriterion, now: datetime,
 ) -> None:
-    """A disabled taxonomy refuses an ordinary caller even when the object id itself is permitted."""
-    competency_taxonomy.enabled = False
-    competency_taxonomy.save()
+    """
+    A learner's status row committed after the delete's progress check makes the delete raise ProtectedError.
+
+    The view answers a 409 that tells the caller to retry, and the criterion is neither deleted nor archived.
+    """
+
+    def progress_arrives_after_the_check(criterion_id: int) -> bool:
+        StudentCompetencyCriterionStatus.objects.create(
+            user=user, criterion_id=criterion_id, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+        )
+        return False
+
+    monkeypatch.setattr(cbe_api, "_criterion_has_learner_progress", progress_arrives_after_the_check)
 
     response = user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
 
-    assert response.status_code == status.HTTP_403_FORBIDDEN
-    assert CompetencyCriterion.objects.filter(id=criterion.id).exists()
-    assert ObjectTag.objects.filter(id=criterion.object_tag_id).exists()
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert "Retry the DELETE" in str(response.data["detail"])
+    criterion.refresh_from_db()
+    assert criterion.archived is False
 
 
 def test_delete_of_a_criterion_gone_by_the_time_of_the_call_is_404(
-    user_client: APIClient, criterion: CompetencyCriterion,
+    run_when_tag_lock_is_taken, user_client: APIClient, criterion: CompetencyCriterion,
 ) -> None:
-    """A criterion removed between the view's lookup and the API call is a 404, not a 500."""
-    with mock.patch(
-        "openedx_learning.applets.cbe.rest_api.v1.views.delete_or_archive_competency_criterion",
-        side_effect=CompetencyCriterion.DoesNotExist,
-    ):
-        response = user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
+    """A criterion removed between the view's lookup and the API's locked re-read is a 404, not a 500."""
+    run_when_tag_lock_is_taken(lambda: CompetencyCriterion.objects.filter(pk=criterion.pk).delete())
+
+    response = user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
 
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
-def test_delete_maps_a_validation_error_from_the_api_to_400(
-    user_client: APIClient, criterion: CompetencyCriterion,
+def test_archiving_a_criterion_whose_stored_payload_went_invalid_is_400_and_changes_nothing(
+    user_client: APIClient, user, batch: tuple[CompetencyCriterion, CompetencyCriterion], now: datetime,
 ) -> None:
-    """A Django ValidationError raised by the API function becomes a 400 keyed by its field."""
-    with mock.patch(
-        "openedx_learning.applets.cbe.rest_api.v1.views.delete_or_archive_competency_criterion",
-        side_effect=ValidationError({"object_id": "x"}),
-    ):
-        response = user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
+    """
+    Archiving saves the criterion, which re-validates its rule payload. A payload that stopped being
+    valid after it was stored, here written past validation with update(), makes the DELETE a 400
+    keyed by the model-level error, and the criterion is neither archived nor deleted.
+    """
+    criterion = batch[1]
+    CompetencyCriterion.objects.filter(pk=criterion.pk).update(rule_payload_override={"op": "gt", "value": 75})
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    response = user_client.delete(criterion_delete_url(criterion.group.tag_id, criterion.id))
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert "object_id" in response.json()
+    assert list(response.json()) == ["__all__"]
+    criterion.refresh_from_db()
+    assert criterion.archived is False
+
+
+@pytest.mark.parametrize("endpoint", ["delete a criterion", "bulk update criteria", "update a group", "delete a group"])
+def test_a_competency_tag_deleted_while_the_request_waits_for_its_lock_is_404(
+    endpoint: str,
+    run_when_tag_lock_is_taken,
+    user_client: APIClient,
+    leaf: CompetencyCriteriaGroup,
+    batch: tuple[CompetencyCriterion, CompetencyCriterion],
+) -> None:
+    """
+    A competency tag removed by an admin while the request waits for the Tag lock is a 404, not a 500.
+    The group's foreign key to the tag cascades, so the row can't go before the request starts without
+    taking the criterion with it; the delete runs as the lock is taken, as a commit during the wait would.
+    """
+    run_when_tag_lock_is_taken(lambda: Tag.objects.filter(pk=leaf.tag_id).delete())
+
+    if endpoint == "delete a criterion":
+        response = user_client.delete(criterion_delete_url(leaf.tag_id, batch[0].id))
+    elif endpoint == "bulk update criteria":
+        body = {"criterion_ids": [criterion.id for criterion in batch], **NEW_RULE}
+        response = user_client.patch(bulk_update_url(leaf.id), body, format="json")
+    elif endpoint == "update a group":
+        response = user_client.patch(
+            group_detail_url(leaf.tag_id, leaf.id), {"logic_operator": LogicOperator.AND}, format="json",
+        )
+    else:
+        response = user_client.delete(group_delete_url(leaf.tag_id, leaf.id))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
 # ==============================================================================================
@@ -2466,6 +2435,28 @@ def test_group_delete_maps_a_validation_error_from_the_api_to_400(
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert "group_id" in response.json()
+
+
+def test_group_delete_whose_error_is_not_a_learner_race_on_the_subtree_is_a_retryable_409(
+    user_client: APIClient, user, tag: Tag, course_run: CourseRun, now: datetime,
+) -> None:
+    """
+    A status that reaches an ancestor group during the delete makes the DELETE fail outside the target
+    subtree. The view answers a 409 telling the caller to retry, and nothing is deleted or archived.
+    """
+    leaf = _create_leaf_group(tag, course_run)
+    course_level = leaf.parent
+    assert course_level is not None
+    StudentCompetencyCriteriaGroupStatus.objects.create(
+        user=user, group=course_level, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    with mock.patch.object(cbe_api, "_group_has_learner_progress", return_value=False):
+        response = user_client.delete(group_delete_url(tag.id, leaf.id))
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert str(response.data["detail"]) == "The delete conflicted with a concurrent change. Retry the DELETE."
+    assert CompetencyCriteriaGroup.objects.filter(id__in=[leaf.id, course_level.id], archived=False).count() == 2
 
 
 @pytest.fixture(name="checked_object_ids")

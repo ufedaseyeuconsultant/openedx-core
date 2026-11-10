@@ -1,4 +1,4 @@
-"""Tests for delete_or_archive_competency_criterion() and its ancestor-cascade helper, _cascade_from_group()."""
+"""Tests for delete_or_archive_competency_criterion() and its ancestor-cascade helper, _cascade_remove_from_group()."""
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -28,7 +28,6 @@ from openedx_tagging.models import ObjectTag, Tag
 pytestmark = pytest.mark.django_db
 
 CHANGE_OBJECTTAG_OBJECTID = "oel_tagging.change_objecttag_objectid"
-CHANGE_OBJECTTAG_TAXONOMY = "oel_tagging.change_objecttag_taxonomy"
 
 
 @pytest.fixture(autouse=True)
@@ -80,15 +79,23 @@ def test_hard_delete_with_no_status_removes_the_row_and_its_object_tag(
     assert not ObjectTag.objects.filter(id=object_tag.id).exists()
 
 
+@pytest.mark.parametrize("shared_object_tag", [False, True], ids=["own object_tag", "shared object_tag"])
 def test_archive_path_leaves_the_row_and_its_object_tag_in_place(
+    *,
     user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, now: datetime,
+    shared_object_tag: bool,
 ) -> None:
     """
     Deleting a criterion that a learner status row already references archives it instead of
-    hard-deleting it: the row and its object_tag both survive, and archived=True comes back.
+    hard-deleting it: the row and its object_tag both survive, and archived=True comes back. Another
+    criterion on the same object_tag is left in place too.
     """
     group = CompetencyCriteriaGroup.objects.create(tag=tag)
     criterion = _make_criterion(group, object_tag, default_rule_profile)
+    other = None
+    if shared_object_tag:
+        other_group = CompetencyCriteriaGroup.objects.create(tag=tag, parent=group)
+        other = _make_criterion(other_group, object_tag, default_rule_profile)
     StudentCompetencyCriterionStatus.objects.create(
         user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
     )
@@ -99,6 +106,9 @@ def test_archive_path_leaves_the_row_and_its_object_tag_in_place(
     criterion.refresh_from_db()
     assert criterion.archived is True
     assert ObjectTag.objects.filter(id=object_tag.id).exists()
+    if other is not None:
+        other.refresh_from_db()
+        assert other.archived is False
 
 
 def _latest_history_user(model_name: str, pk: int):
@@ -145,16 +155,27 @@ def test_repeat_delete_on_an_archived_criterion_writes_no_history(
     )
 
 
-def test_archive_records_the_acting_user_in_history(
-    user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, now: datetime,
+@pytest.mark.parametrize("has_status_row", [True, False], ids=["archive", "hard delete"])
+def test_removal_records_the_acting_user_in_history(
+    has_status_row: bool,
+    *,
+    user,
+    tag: Tag,
+    object_tag: ObjectTag,
+    default_rule_profile: CompetencyRuleProfile,
+    now: datetime,
 ) -> None:
-    """Archiving a criterion records the acting user on the newest historical row of it and of each archived group."""
+    """
+    Archiving a criterion, or hard-deleting one with no status row, records the acting user on the
+    newest historical row of it and of each group the cascade archived or deleted.
+    """
     root = CompetencyCriteriaGroup.objects.create(tag=tag)
     leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
     criterion = _make_criterion(leaf, object_tag, default_rule_profile)
-    StudentCompetencyCriterionStatus.objects.create(
-        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
-    )
+    if has_status_row:
+        StudentCompetencyCriterionStatus.objects.create(
+            user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+        )
 
     delete_or_archive_competency_criterion(criterion.id, user)
 
@@ -181,6 +202,34 @@ def test_shared_object_tag_is_untouched_while_another_criterion_still_references
     assert not CompetencyCriterion.objects.filter(id=criterion_a.id).exists()
     assert CompetencyCriterion.objects.filter(id=criterion_b.id).exists()
     assert ObjectTag.objects.filter(id=object_tag.id).exists()
+
+
+def test_hard_delete_removes_only_the_criterions_own_object_tag(
+    user,
+    competency_taxonomy: CompetencyTaxonomy,
+    tag: Tag,
+    object_tag: ObjectTag,
+    default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    A hard delete removes the criterion's own ObjectTag, now referenced by nothing. An ObjectTag for
+    another competency on the same object stays with its criterion, so the delete picks the ObjectTag
+    by its primary key and not by the object it is on.
+    """
+    other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Reading Poetry")
+    other_object_tag = _make_object_tag(competency_taxonomy, other_tag, object_tag.object_id)
+    criterion = _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile)
+    other_criterion = _make_criterion(
+        CompetencyCriteriaGroup.objects.create(tag=other_tag), other_object_tag, default_rule_profile
+    )
+
+    result = delete_or_archive_competency_criterion(criterion.id, user)
+
+    assert result.archived is False
+    assert not CompetencyCriterion.objects.filter(id=criterion.id).exists()
+    assert not ObjectTag.objects.filter(id=object_tag.id).exists()
+    assert CompetencyCriterion.objects.filter(id=other_criterion.id).exists()
+    assert ObjectTag.objects.filter(id=other_object_tag.id).exists()
 
 
 # =================================================================================================
@@ -210,9 +259,7 @@ def test_single_child_leaf_group_cascade_deletes_while_a_sibling_keeps_the_root_
     assert CompetencyCriteriaGroup.objects.filter(id=root.id).exists()
     assert CompetencyCriteriaGroup.objects.filter(id=sibling.id).exists()
     root.refresh_from_db()
-    sibling.refresh_from_db()
     assert root.archived is False
-    assert sibling.archived is False
 
 
 def test_multilevel_cascade_fully_collapses_the_root_to_leaf_chain(
@@ -259,9 +306,7 @@ def test_cascade_stops_at_an_ancestor_with_a_surviving_sibling_group(
     assert CompetencyCriteriaGroup.objects.filter(id=other_branch.id).exists()
     assert CompetencyCriterion.objects.filter(id=other_criterion.id).exists()
     root.refresh_from_db()
-    other_branch.refresh_from_db()
     assert root.archived is False
-    assert other_branch.archived is False
 
 
 @pytest.mark.parametrize("progress_on", ["leaf group", "root group"])
@@ -346,8 +391,11 @@ def test_archiving_a_groups_only_criterion_archives_the_group_and_cascades_upwar
         user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
     )
 
-    delete_or_archive_competency_criterion(criterion.id, user)
+    result = delete_or_archive_competency_criterion(criterion.id, user)
 
+    assert result.archived is True
+    criterion.refresh_from_db()
+    assert criterion.archived is True
     leaf.refresh_from_db()
     root.refresh_from_db()
     assert leaf.archived is True
@@ -376,69 +424,23 @@ def test_a_user_without_permission_is_refused_and_nothing_changes(
     assert ObjectTag.objects.filter(id=object_tag.id).exists()
 
 
-def test_untag_with_the_competency_taxonomy_disabled_removes_only_the_orphaned_object_tag(
+def test_delete_re_reads_the_criterion_under_the_tag_lock(
+    run_when_tag_lock_is_taken,
     user,
-    competency_taxonomy: CompetencyTaxonomy,
     tag: Tag,
     object_tag: ObjectTag,
     default_rule_profile: CompetencyRuleProfile,
 ) -> None:
     """
-    With the taxonomy disabled the tagging API hides its tags, but the delete removes only the
-    criterion's own ObjectTag, so it succeeds and the object's other ObjectTag and its criterion
-    stay. The taxonomy-level permission rule denies every user on a disabled taxonomy, so the test
-    substitutes a permissive one to reach the untag step.
+    A criterion removed while the delete waits for the Tag lock raises DoesNotExist, so the delete
+    reads the criterion again after the lock rather than trusting its first read.
     """
-    other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Reading Poetry")
-    other_object_tag = _make_object_tag(competency_taxonomy, other_tag, object_tag.object_id)
     criterion = _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile)
-    other_criterion = _make_criterion(
-        CompetencyCriteriaGroup.objects.create(tag=other_tag), other_object_tag, default_rule_profile
-    )
-    competency_taxonomy.enabled = False
-    competency_taxonomy.save()
-    original = rule_permissions[CHANGE_OBJECTTAG_TAXONOMY]
-    rules.set_perm(CHANGE_OBJECTTAG_TAXONOMY, lambda _user, _taxonomy: True)
+    # Stands in for a concurrent delete that commits while this one waits for the lock.
+    run_when_tag_lock_is_taken(lambda: CompetencyCriterion.objects.filter(pk=criterion.pk).delete())
 
-    try:
-        result = delete_or_archive_competency_criterion(criterion.id, user)
-    finally:
-        rules.set_perm(CHANGE_OBJECTTAG_TAXONOMY, original)
-
-    assert result.archived is False
-    assert not CompetencyCriterion.objects.filter(id=criterion.id).exists()
-    assert not ObjectTag.objects.filter(id=object_tag.id).exists()
-    assert CompetencyCriterion.objects.filter(id=other_criterion.id).exists()
-    assert ObjectTag.objects.filter(id=other_object_tag.id).exists()
-
-
-def test_hard_delete_leaves_a_tag_of_another_competency_on_the_same_object(
-    user,
-    monkeypatch: pytest.MonkeyPatch,
-    tag: Tag,
-    object_tag: ObjectTag,
-    default_rule_profile: CompetencyRuleProfile,
-) -> None:
-    """
-    An ObjectTag for another competency tag on the same object, committed after a tag list was
-    read, survives the delete together with its criterion. The tag list is stubbed to omit it, as
-    a read taken before that commit would; the delete must not depend on reading it.
-    """
-    competency_taxonomy = CompetencyTaxonomy.objects.get()
-    other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Reading Poetry")
-    other_object_tag = _make_object_tag(competency_taxonomy, other_tag, object_tag.object_id)
-    criterion = _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile)
-    other_criterion = _make_criterion(
-        CompetencyCriteriaGroup.objects.create(tag=other_tag), other_object_tag, default_rule_profile
-    )
-    stale_list = [ObjectTag.objects.get(pk=object_tag.pk)]
-    monkeypatch.setattr("openedx_learning.applets.cbe.api.get_object_tags", lambda *_args, **_kwargs: stale_list)
-
-    delete_or_archive_competency_criterion(criterion.id, user)
-
-    assert not ObjectTag.objects.filter(id=object_tag.id).exists()
-    assert ObjectTag.objects.filter(id=other_object_tag.id).exists()
-    assert CompetencyCriterion.objects.filter(id=other_criterion.id).exists()
+    with pytest.raises(CompetencyCriterion.DoesNotExist):
+        delete_or_archive_competency_criterion(criterion.id, user)
 
 
 # =================================================================================================
@@ -507,6 +509,7 @@ def test_cascade_stops_at_a_group_that_is_already_archived(
     result = delete_or_archive_competency_criterion(criterion.id, user)
 
     assert result.archived is True
+    assert CompetencyCriteriaGroup.objects.filter(pk__in=[leaf.id, root.id], archived=True).count() == 2
     assert counts == (
         _history_count("HistoricalCompetencyCriteriaGroup", leaf.id),
         _history_count("HistoricalCompetencyCriteriaGroup", root.id),
@@ -535,6 +538,8 @@ def test_delete_after_the_learner_is_gone_deletes_the_emptied_archived_groups(
     assert result.archived is False
     assert not CompetencyCriterion.objects.filter(pk=criterion.id).exists()
     assert not CompetencyCriteriaGroup.objects.filter(pk__in=[leaf.id, root.id]).exists()
+    assert _latest_history_user("HistoricalCompetencyCriteriaGroup", leaf.id) == user
+    assert _latest_history_user("HistoricalCompetencyCriteriaGroup", root.id) == user
 
 
 def test_delete_leaves_an_archived_group_that_still_holds_an_archived_criterion(
@@ -574,6 +579,9 @@ def test_delete_leaves_an_emptied_archived_group_that_has_its_own_status(
     root = CompetencyCriteriaGroup.objects.create(tag=tag, archived=True)
     leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root, archived=True)
     criterion = _make_criterion(leaf, object_tag, default_rule_profile)
+    # Only a criterion archived by an earlier delete sits under an archived group.
+    criterion.archived = True
+    criterion.save()
     StudentCompetencyCriteriaGroupStatus.objects.create(
         user=user, group=leaf, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
     )

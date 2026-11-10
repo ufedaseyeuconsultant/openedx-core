@@ -1,4 +1,5 @@
 """Shared fixtures for the CBE test modules: schema, deletion, tree-integration, status, and REST tests."""
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 import pytest
@@ -8,7 +9,14 @@ from organizations.models import Organization
 from rest_framework.test import APIClient
 
 from openedx_catalog.models import CatalogCourse, CourseRun
-from openedx_learning.models import CompetencyCriteriaGroup, CompetencyRuleProfile, CompetencyTaxonomy
+from openedx_learning.models import (
+    CompetencyCriteriaGroup,
+    CompetencyMasteryStatus,
+    CompetencyRuleProfile,
+    CompetencyTaxonomy,
+    MasteryStatus,
+    RuleType,
+)
 from openedx_tagging.models import ObjectTag, Tag
 
 
@@ -71,6 +79,24 @@ def _default_rule_profile() -> CompetencyRuleProfile:
     )
 
 
+@pytest.fixture(name="migration_seed_rows")
+def _migration_seed_rows() -> None:
+    """Recreate the rows migrations 0005 and 0009 seed, which a transactional test's flush deletes."""
+    labels = {
+        MasteryStatus.ATTEMPTED_NOT_DEMONSTRATED: "AttemptedNotDemonstrated",
+        MasteryStatus.PARTIALLY_ATTEMPTED: "PartiallyAttempted",
+        MasteryStatus.DEMONSTRATED: "Demonstrated",
+    }
+    for status, label in labels.items():
+        CompetencyMasteryStatus.objects.get_or_create(id=status.value, defaults={"status": label})
+    CompetencyRuleProfile.objects.get_or_create(
+        organization=None,
+        course=None,
+        competency_taxonomy=None,
+        defaults={"rule_type": RuleType.GRADE, "rule_payload": {"op": "gte", "value": 0.8, "scale": "percent"}},
+    )
+
+
 @pytest.fixture(name="staff_user")
 def _staff_user():
     """A user permitted to administer taxonomies, and so every competency rule profile."""
@@ -101,3 +127,35 @@ def _staff_client(staff_user) -> APIClient:
     client = APIClient()
     client.force_authenticate(user=staff_user)
     return client
+
+
+@pytest.fixture(name="run_when_tag_lock_is_taken")
+def _run_when_tag_lock_is_taken(monkeypatch: pytest.MonkeyPatch) -> Callable[[Callable[[], None]], None]:
+    """
+    Return a function that makes the API run a callable as it takes the Tag row lock.
+
+    The callable runs once, before the API reads the Tag. It stands in for a transaction that commits
+    while the API waits for the lock, so a read the API makes after taking the lock sees the change and
+    a read it made earlier doesn't.
+    """
+
+    def _install(side_effect: Callable[[], None]) -> None:
+        original_select_for_update = Tag.objects.select_for_update
+        fired: list[bool] = []
+
+        def _select_for_update(*args, **kwargs):
+            queryset = original_select_for_update(*args, **kwargs)
+            original_get = queryset.get
+
+            def _get(*get_args, **get_kwargs):
+                if not fired:
+                    fired.append(True)
+                    side_effect()
+                return original_get(*get_args, **get_kwargs)
+
+            queryset.get = _get
+            return queryset
+
+        monkeypatch.setattr(Tag.objects, "select_for_update", _select_for_update)
+
+    return _install

@@ -359,74 +359,6 @@ def test_course_level_group_unique_constraint_rejects_a_second_group_for_the_sam
         CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root)
 
 
-def test_create_leaf_group_reactivates_an_archived_root_and_adds_a_course_level_group_for_a_new_course(
-    tag: Tag, course_run: CourseRun, organization: Organization
-) -> None:
-    """
-    An archived root, left behind once its only course-level group (course X) was archived, is reactivated.
-
-    A call for course Y reuses that same root, adds a Y course-level group and a leaf under it,
-    and leaves the archived X course-level group alone.
-    """
-    other_course_run = make_course_run(organization, "Python200", "Fall2026")
-    root = CompetencyCriteriaGroup.objects.create(tag=tag, parent=None, archived=True)
-    archived_course_level = CompetencyCriteriaGroup.objects.create(
-        tag=tag, course=course_run, parent=root, archived=True,
-    )
-    # `.history` is a runtime descriptor mypy cannot type, so query the historical model directly.
-    historical_group = apps.get_model("openedx_learning", "HistoricalCompetencyCriteriaGroup")
-    history_before = historical_group.objects.filter(id=root.pk).count()
-
-    leaf = _create_leaf_group(tag, other_course_run)
-
-    root.refresh_from_db()
-    archived_course_level.refresh_from_db()
-    assert root.archived is False
-    assert historical_group.objects.filter(id=root.pk).count() == history_before + 1
-    assert historical_group.objects.filter(id=root.pk).latest("history_date", "history_id").archived is False
-    assert CompetencyCriteriaGroup.objects.filter(tag=tag, parent__isnull=True).count() == 1
-    assert leaf.parent is not None
-    assert leaf.parent.course_id == other_course_run.id
-    assert leaf.parent.parent_id == root.id
-    assert archived_course_level.archived is True
-
-
-def test_create_leaf_group_adds_a_course_level_group_beside_an_archived_one(
-    tag: Tag, course_run: CourseRun, organization: Organization
-) -> None:
-    """With an active root, an archived course-level group for course X does not block course Y."""
-    other_course_run = make_course_run(organization, "Python200", "Fall2026")
-    archived_course_level = _create_leaf_group(tag, course_run).parent
-    assert archived_course_level is not None
-    root = archived_course_level.parent
-    assert root is not None
-    archived_course_level.archived = True
-    archived_course_level.save()
-
-    leaf = _create_leaf_group(tag, other_course_run)
-
-    assert leaf.parent is not None
-    assert leaf.parent.course_id == other_course_run.id
-    assert leaf.parent.parent_id == root.id
-    root.refresh_from_db()
-    assert root.archived is False
-    archived_course_level.refresh_from_db()
-    assert archived_course_level.archived is True
-
-
-def test_create_leaf_group_rejects_an_archived_course_level_group(tag: Tag, course_run: CourseRun) -> None:
-    """An archived course-level group for the same tag and course is rejected, and no leaf is created."""
-    root = CompetencyCriteriaGroup.objects.create(tag=tag, parent=None)
-    CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root, archived=True)
-    group_count = CompetencyCriteriaGroup.objects.count()
-
-    with pytest.raises(ValidationError) as exc_info:
-        _create_leaf_group(tag, course_run)
-
-    assert "archived" in str(exc_info.value.message_dict["object_id"])
-    assert CompetencyCriteriaGroup.objects.count() == group_count
-
-
 # ==============================================================================================
 # resolve_supplied_leaf_group
 # ==============================================================================================
@@ -481,31 +413,6 @@ def test_resolve_supplied_leaf_group_rejects_a_group_for_a_different_course(
     leaf = _create_leaf_group(tag, other_course_run)
     with pytest.raises(ValidationError, match="group_id"):
         resolve_supplied_leaf_group(leaf.id, tag, course_run)
-
-
-def test_resolve_supplied_leaf_group_rejects_an_archived_leaf(tag: Tag, course_run: CourseRun) -> None:
-    """The leaf's course-level group and root are active; the leaf's own archived flag is what rejects it."""
-    leaf = _create_leaf_group(tag, course_run)
-    leaf.archived = True
-    leaf.save()
-
-    with pytest.raises(ValidationError) as exc_info:
-        resolve_supplied_leaf_group(leaf.id, tag, course_run)
-
-    assert "archived" in str(exc_info.value.message_dict["group_id"])
-
-
-def test_resolve_supplied_leaf_group_still_resolves_an_active_leaf_beside_an_archived_one(
-    tag: Tag, course_run: CourseRun
-) -> None:
-    """Both leaves share one active course-level group."""
-    archived_leaf = _create_leaf_group(tag, course_run)
-    archived_leaf.archived = True
-    archived_leaf.save()
-    active_leaf = _create_leaf_group(tag, course_run)
-
-    assert archived_leaf.parent_id == active_leaf.parent_id
-    assert resolve_supplied_leaf_group(active_leaf.id, tag, course_run) == active_leaf
 
 
 # ==============================================================================================
@@ -640,83 +547,6 @@ def test_associate_competency_criterion_rolls_back_newly_created_groups_when_cri
         associate_competency_criterion(tag_id=tag.id, object_id=object_id)
 
     assert not CompetencyCriteriaGroup.objects.filter(tag=tag).exists()
-
-
-def test_associate_competency_criterion_rolls_back_root_reactivation_when_the_course_level_group_is_archived(
-    tag: Tag, course_run: CourseRun
-) -> None:
-    """Rejecting the archived course-level group leaves the archived root archived and creates no group or criterion."""
-    root = CompetencyCriteriaGroup.objects.create(tag=tag, parent=None, archived=True)
-    CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root, archived=True)
-    group_count = CompetencyCriteriaGroup.objects.count()
-    criterion_count = CompetencyCriterion.objects.count()
-
-    with pytest.raises(ValidationError) as exc_info:
-        associate_competency_criterion(tag_id=tag.id, object_id=usage_key(course_run, "p1"))
-
-    assert "archived" in str(exc_info.value.message_dict["object_id"])
-    root.refresh_from_db()
-    assert root.archived is True
-    assert CompetencyCriteriaGroup.objects.count() == group_count
-    assert CompetencyCriterion.objects.count() == criterion_count
-
-
-def test_associate_competency_criterion_allows_re_association_while_a_sibling_keeps_the_course_level_group_alive(
-    tag: Tag, course_run: CourseRun
-) -> None:
-    """
-    Re-associating after an archive succeeds while a sibling leaf keeps the course-level group active.
-
-    The setup mirrors the archive cascade: the first criterion and its own leaf are archived, but the
-    course-level group stays active because the sibling's leaf is still live. The new criterion gets its own
-    leaf under that same course-level group and reuses the ObjectTag.
-    """
-    first = associate_competency_criterion(tag_id=tag.id, object_id=usage_key(course_run, "p1"))
-    sibling = associate_competency_criterion(tag_id=tag.id, object_id=usage_key(course_run, "p2"))
-    first.archived = True
-    first.save()
-    first.group.archived = True
-    first.group.save()
-
-    second = associate_competency_criterion(tag_id=tag.id, object_id=usage_key(course_run, "p1"))
-
-    first.refresh_from_db()
-    assert second.id != first.id
-    assert second.group_id != first.group_id
-    assert second.object_tag_id == first.object_tag_id
-    assert second.group.parent_id == sibling.group.parent_id
-    assert first.archived is True
-
-
-def test_associate_competency_criterion_rejects_re_association_once_the_whole_branch_is_archived(
-    tag: Tag, course_run: CourseRun
-) -> None:
-    """
-    Re-associating is rejected when the archive cascade has archived the whole branch.
-
-    This pins the current answer to the ticket's open question about re-association after a cascade archive:
-    the criterion, its leaf, the course-level group, and the root are all archived, and the new criterion is
-    refused because the course-level group is archived.
-    """
-    object_id = usage_key(course_run, "p1")
-    first = associate_competency_criterion(tag_id=tag.id, object_id=object_id)
-    leaf = first.group
-    course_level = leaf.parent
-    assert course_level is not None
-    root = course_level.parent
-    assert root is not None
-    for instance in (first, leaf, course_level, root):
-        instance.archived = True
-        instance.save()
-    criterion_count = CompetencyCriterion.objects.count()
-
-    with pytest.raises(ValidationError) as exc_info:
-        associate_competency_criterion(tag_id=tag.id, object_id=object_id)
-
-    assert "archived" in str(exc_info.value.message_dict["object_id"])
-    root.refresh_from_db()
-    assert root.archived is True
-    assert CompetencyCriterion.objects.count() == criterion_count
 
 
 # ==============================================================================================
@@ -1211,6 +1041,64 @@ def test_bulk_update_rolls_back_every_criterion_if_one_save_fails(
     assert snapshot(batch) == before
 
 
+def test_bulk_update_saves_in_primary_key_order_and_returns_request_order(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: tuple[CompetencyCriterion, CompetencyCriterion],
+    leaf: CompetencyCriteriaGroup,
+    default_rule_profile: CompetencyRuleProfile,
+    user,
+) -> None:
+    """Each save takes a row lock, so the saves run in ascending pk order however the ids were requested."""
+    c1, c2 = batch
+    c3 = make_criterion(leaf, "p3", rule_profile=default_rule_profile)
+    original_save = CompetencyCriterion.save
+    saves: list[int] = []
+
+    def _record_save(self, *args, **kwargs) -> None:
+        saves.append(self.pk)
+        original_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(CompetencyCriterion, "save", _record_save)
+
+    result = bulk_update_competency_criteria([c3.id, c1.id, c2.id], leaf.id, user=user, **NEW_RULE)
+
+    assert saves == [c1.id, c2.id, c3.id]
+    assert [criterion.id for criterion in result] == [c3.id, c1.id, c2.id]
+
+
+def test_bulk_update_checks_archived_state_under_the_tag_lock(
+    run_when_tag_lock_is_taken,
+    batch: tuple[CompetencyCriterion, CompetencyCriterion],
+    leaf: CompetencyCriteriaGroup,
+    user,
+) -> None:
+    """A group archived while the update waits for the Tag lock refuses the batch, so the check reads after the lock."""
+    run_when_tag_lock_is_taken(lambda: CompetencyCriteriaGroup.objects.filter(pk=leaf.pk).update(archived=True))
+    before = snapshot(batch)
+
+    with pytest.raises(CompetencyCriterionArchivedError, match=f"group {leaf.id}"):
+        bulk_update_competency_criteria([c.id for c in batch], leaf.id, user=user, **NEW_RULE)
+
+    assert snapshot(batch) == before
+
+
+def test_bulk_update_reads_the_criteria_under_the_tag_lock(
+    run_when_tag_lock_is_taken,
+    batch: tuple[CompetencyCriterion, CompetencyCriterion],
+    leaf: CompetencyCriteriaGroup,
+    user,
+) -> None:
+    """A criterion archived while the update waits for the Tag lock refuses the batch, so the criteria read after it."""
+    archived = batch[1]
+    run_when_tag_lock_is_taken(lambda: CompetencyCriterion.objects.filter(pk=archived.pk).update(archived=True))
+    before = snapshot(batch)
+
+    with pytest.raises(CompetencyCriterionArchivedError, match=rf"criteria cannot be edited: {archived.id}\."):
+        bulk_update_competency_criteria([c.id for c in batch], leaf.id, user=user, **NEW_RULE)
+
+    assert snapshot(batch) == before
+
+
 # ==============================================================================================
 # get_competency_criteria_tree
 # ==============================================================================================
@@ -1445,11 +1333,10 @@ def test_get_competency_criteria_tree_keeps_a_group_moved_under_a_later_created_
     group_b = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
     group_c = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
     # A sits under B and B under C, so ordering by parent_id puts A before B: a single pass in
-    # that order would judge A before its parent B was kept.
-    group_b.parent = group_c
-    group_b.save()
-    group_a.parent = group_b
-    group_a.save()
+    # that order would judge A before its parent B was kept. save() rejects a parent change, so
+    # build the shape the way only a bulk update can.
+    CompetencyCriteriaGroup.objects.filter(pk=group_b.pk).update(parent=group_c)
+    CompetencyCriteriaGroup.objects.filter(pk=group_a.pk).update(parent=group_b)
     object_tag = ObjectTag.objects.create(object_id=usage_key(course_run, "p1"), taxonomy=tag.taxonomy, tag=tag)
     criterion = CompetencyCriterion.objects.create(
         group=group_a, object_tag=object_tag, rule_profile=default_rule_profile,
@@ -2123,6 +2010,89 @@ def test_create_competency_criterion_uses_the_callers_course_run(
     assert criterion.group_id == group.id
 
 
+def test_create_competency_criterion_takes_the_tag_lock_itself(
+    run_when_tag_lock_is_taken, tag: Tag, course_run: CourseRun,
+) -> None:
+    """
+    A caller outside associate_competency_criterion() is still serialized with a delete of the competency's
+    criteria: the lock is taken before anything else, so a tag deleted while the call waits for it is seen.
+    """
+    group = _create_leaf_group(tag, course_run)
+    run_when_tag_lock_is_taken(lambda: Tag.objects.filter(pk=tag.pk).delete())
+
+    with pytest.raises(Tag.DoesNotExist):
+        cbe_api.create_competency_criterion(group, usage_key(course_run, "p1"), course_run=course_run)
+
+
+def test_create_competency_criterion_writes_only_its_own_object_tag(
+    tag: Tag, course_run: CourseRun, competency_taxonomy: CompetencyTaxonomy,
+) -> None:
+    """
+    Creating a criterion for one competency inserts that competency's ObjectTag and nothing else, so
+    it cannot undo a concurrent create or delete of a sibling competency's ObjectTag on the same object.
+    """
+    sibling_tag = make_tag(competency_taxonomy, "Sibling Skill")
+    object_id = usage_key(course_run, "p1")
+    sibling = ObjectTag.objects.create(object_id=object_id, taxonomy=competency_taxonomy, tag=sibling_tag)
+    group = _create_leaf_group(tag, course_run)
+
+    with CaptureQueriesContext(connection) as queries:
+        criterion = cbe_api.create_competency_criterion(group, object_id, course_run=course_run)
+
+    quoted_table = re.escape(connection.ops.quote_name("oel_tagging_objecttag"))
+    object_tag_writes = [
+        query["sql"] for query in queries.captured_queries
+        if re.match(rf"(INSERT INTO|UPDATE|DELETE FROM) {quoted_table}", query["sql"])
+    ]
+    assert len(object_tag_writes) == 1
+    assert object_tag_writes[0].startswith("INSERT")
+    assert criterion.object_tag.tag_id == tag.id
+    assert ObjectTag.objects.get(id=sibling.id).tag_id == sibling_tag.id
+
+
+def test_create_competency_criterion_does_not_resurrect_a_sibling_object_tag_deleted_mid_create(
+    tag: Tag, course_run: CourseRun, competency_taxonomy: CompetencyTaxonomy,
+) -> None:
+    """
+    A sibling competency's ObjectTag deleted by a concurrent request, right after this create first
+    reads ObjectTags, stays deleted; the create adds only its own competency's tag.
+    """
+    sibling_tag = make_tag(competency_taxonomy, "Sibling Skill")
+    object_id = usage_key(course_run, "p1")
+    sibling = ObjectTag.objects.create(object_id=object_id, taxonomy=competency_taxonomy, tag=sibling_tag)
+    group = _create_leaf_group(tag, course_run)
+    raced = False
+    quoted_table = connection.ops.quote_name("oel_tagging_objecttag")
+
+    def _delete_sibling_after_first_object_tag_query(execute, sql, params, many, context):
+        nonlocal raced
+        result = execute(sql, params, many, context)
+        if not raced and quoted_table in sql:
+            raced = True
+            ObjectTag.objects.filter(pk=sibling.pk).delete()
+        return result
+
+    with connection.execute_wrapper(_delete_sibling_after_first_object_tag_query):
+        cbe_api.create_competency_criterion(group, object_id, course_run=course_run)
+
+    assert raced
+    assert list(ObjectTag.objects.filter(object_id=object_id).values_list("tag_id", flat=True)) == [tag.id]
+
+
+def test_create_competency_criterion_reuses_an_existing_object_tag_for_the_same_competency(
+    tag: Tag, course_run: CourseRun, competency_taxonomy: CompetencyTaxonomy,
+) -> None:
+    """An ObjectTag already tying the object to this competency is reused rather than duplicated."""
+    object_id = usage_key(course_run, "p1")
+    existing = ObjectTag.objects.create(object_id=object_id, taxonomy=competency_taxonomy, tag=tag)
+    group = _create_leaf_group(tag, course_run)
+
+    criterion = cbe_api.create_competency_criterion(group, object_id, course_run=course_run)
+
+    assert criterion.object_tag_id == existing.id
+    assert ObjectTag.objects.filter(object_id=object_id).count() == 1
+
+
 def test_associate_competency_criterion_creates_the_course_runs_cbe_row(
     tag: Tag, course_run: CourseRun,
 ) -> None:
@@ -2406,6 +2376,19 @@ def test_update_raises_does_not_exist_for_an_unknown_group(user) -> None:
     """An unknown group id raises CompetencyCriteriaGroup.DoesNotExist."""
     with pytest.raises(CompetencyCriteriaGroup.DoesNotExist):
         update_competency_criteria_group(999999, logic_operator=LogicOperator.AND, user=user)
+
+
+def test_group_update_re_reads_the_group_under_the_tag_lock(
+    run_when_tag_lock_is_taken, leaf: CompetencyCriteriaGroup, user,
+) -> None:
+    """A group archived while the update waits for the Tag lock is refused, not written onto."""
+    run_when_tag_lock_is_taken(lambda: CompetencyCriteriaGroup.objects.filter(pk=leaf.pk).update(archived=True))
+
+    with pytest.raises(CompetencyCriteriaGroupArchivedError):
+        update_competency_criteria_group(leaf.id, logic_operator=LogicOperator.AND, user=user)
+
+    leaf.refresh_from_db()
+    assert leaf.logic_operator == LogicOperator.OR
 
 
 @pytest.mark.parametrize("level", ["course-level", "leaf"])

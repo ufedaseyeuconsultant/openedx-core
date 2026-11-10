@@ -7,10 +7,10 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Iterable, Literal, Sequence, cast
+from typing import Any, Iterable, Sequence, cast
 
 from django.core.exceptions import NON_FIELD_ERRORS, PermissionDenied, ValidationError
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import F, Q, QuerySet
 from django.db.transaction import TransactionManagementError
 from django.utils.translation import gettext_lazy as _
@@ -19,7 +19,8 @@ from opaque_keys.edx.keys import CourseKey, UsageKey
 
 from openedx_catalog.api import get_course_run, get_course_run_ids
 from openedx_catalog.models_api import CourseRun
-from openedx_tagging.api import create_taxonomy, get_ancestor_tags, get_descendant_tags, get_object_tags, tag_object
+from openedx_tagging import api as tagging_api
+from openedx_tagging.api import create_taxonomy, get_ancestor_tags, get_descendant_tags
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 from openedx_tagging.rules import ObjectTagPermissionItem, UserType
 
@@ -35,7 +36,9 @@ from .models import (
     StudentCompetencyCriteriaGroupStatus,
     StudentCompetencyCriterionStatus,
 )
+from .rollup import roll_up_competency_statuses
 from .rule_payloads import evaluate_rule
+from .statuses import raise_status
 
 __all__ = [
     "CompetencyCriteriaGroupArchivedError",
@@ -58,6 +61,7 @@ __all__ = [
     "resolve_competency_criteria_group_course",
     "resolve_competency_tag",
     "resolve_supplied_leaf_group",
+    "roll_up_competency_statuses",
     "select_competency_taxonomies",
     "update_competency_criteria_group",
 ]
@@ -221,9 +225,9 @@ def get_competency_criteria_tree(tag: Tag, course_keys: list[CourseKey] | None =
     if not groups:
         return CompetencyCriteriaTree(groups=[], criteria=[], criteria_count=0, total_criteria_count=0)
 
-    # Walk down from the roots instead of relying on row order: ordering by parent_id does not
-    # guarantee a parent comes before its child once groups can be moved, since a parent may
-    # then have a larger id than its child.
+    # Walk down from the roots instead of relying on row order. A group's parent is fixed once
+    # saved, but a QuerySet.update() can still give a group a parent with a larger id, and
+    # ordering by parent_id would then visit that child before its parent.
     groups_by_parent_id: dict[int | None, list[CompetencyCriteriaGroup]] = {}
     for group in groups:
         groups_by_parent_id.setdefault(group.parent_id, []).append(group)
@@ -292,34 +296,25 @@ def _create_leaf_group(
     tag/course pair can hold more than one leaf, one per criterion. The root and course-level
     group names are truncated to fit the name column; they are never shown in the UI.
 
-    An archived root is reactivated in place. Raises ValidationError (keyed "object_id") if the
-    course-level group is archived.
-
-    Must run inside a transaction holding the tag row lock.
+    The root and course-level lookups need no lock of their own: the unique constraints hold one
+    root per tag and one course-level group per tag and course, and ``get_or_create()`` recovers
+    from a concurrent insert. The caller's tag lock is for ``_reject_duplicate_criterion()``. The delete path
+    relies on the same lock to keep this function's inserts out of its emptiness-check window.
     """
     name_max_length = CompetencyCriteriaGroup._meta.get_field("name").max_length
-    # Reactivate rather than reject an archived root: it is archived once its last course is, so rejecting
-    # would lock the competency. The throwaway name avoids shadowing the gettext alias ``_``.
-    root, _created = CompetencyCriteriaGroup.objects.get_or_create(
+    # Both get_or_create() lookups match archived rows deliberately, so an archived container is
+    # never replaced; rejecting or reactivating it is the archived-group checks' decision.
+    root, _ = CompetencyCriteriaGroup.objects.get_or_create(
         tag=tag,
         parent=None,
         defaults={"name": f"{tag.value} (root)"[:name_max_length]},
     )
-    if root.archived:
-        # save(), not update(), so simple_history records the reactivation.
-        root.archived = False
-        root.save()
-    course_level_group, _created = CompetencyCriteriaGroup.objects.get_or_create(
+    course_level_group, _ = CompetencyCriteriaGroup.objects.get_or_create(
         tag=tag,
         course=course_run,
         parent=root,
         defaults={"name": f"{tag.value} — {course_run.title}"[:name_max_length]},
     )
-    if course_level_group.archived:
-        raise ValidationError({"object_id": _(
-            "The course-level CompetencyCriteriaGroup for this competency and course is archived "
-            "and no longer accepts new associations."
-        )})
     return CompetencyCriteriaGroup.objects.create(
         tag=tag,
         course=None,
@@ -336,8 +331,8 @@ def resolve_supplied_leaf_group(group_id: int, tag: Tag, course_run: CourseRun) 
     and archive behavior may change this function's shape without a deprecation cycle.
 
     Raises CompetencyCriteriaGroup.DoesNotExist if it doesn't exist, or ValidationError (keyed
-    "group_id") if it isn't a leaf, doesn't belong to ``tag``, has a course that doesn't match
-    ``course_run``, or is archived.
+    "group_id") if it isn't a leaf, doesn't belong to ``tag``, or its course doesn't match
+    ``course_run``.
     """
     group = CompetencyCriteriaGroup.objects.get(pk=group_id)
     if group.parent_id is None or group.course_id is not None:
@@ -346,11 +341,6 @@ def resolve_supplied_leaf_group(group_id: int, tag: Tag, course_run: CourseRun) 
         raise ValidationError({"group_id": _("group_id must belong to the given competency tag.")})
     if group.parent.course_id != course_run.id:
         raise ValidationError({"group_id": _("group_id must belong to the given course.")})
-    # Archiving never leaves an active group under an archived one, so the leaf's own flag is enough.
-    if group.archived:
-        raise ValidationError({"group_id": _(
-            "group_id references an archived CompetencyCriteriaGroup, which no longer accepts new associations."
-        )})
     return group
 
 
@@ -439,33 +429,52 @@ def create_competency_criterion(
     UNSTABLE: the criteria-authoring family is incomplete, so its validation and group update
     and archive behavior may change this function's shape without a deprecation cycle.
 
-    ``tag_object()`` replaces an object's full tag list for a taxonomy rather than appending, so
-    this reads the object's existing tags first and unions in the new one, rather than silently
-    dropping a sibling competency's tag under the same taxonomy. Raises ValidationError (keyed
-    "object_id") when the taxonomy refuses the tag, e.g. it allows only one tag per object.
+    Adds only this competency's ObjectTag to the object, reusing it if it already exists. Other tags
+    on the object, including other competencies' tags in the same taxonomy, are never read or
+    changed, so a concurrent create or delete for another competency cannot be undone by this one.
+    Raises ValidationError (keyed "object_id") when the taxonomy allows one tag per object and the
+    object already has a tag in it, or when the object is at the tag limit.
 
     When no rule fields are supplied, resolves to the live profile scoped to the tag's taxonomy,
     else the live system default, rather than persisting null: ADR-0002 Decision 4 always
     resolves to a concrete profile, and the model's own xor-override constraint forbids leaving
     all three fields null.
 
-    ``course_run`` is ``group``'s course. Must run inside a transaction holding the tag and
-    course run locks that associate_competency_criterion() takes, so the dominance check below
-    can't race another create.
+    ``course_run`` is ``group``'s course. Must run inside a transaction. This function takes the
+    competency's Tag row lock itself, so a concurrent delete of a sibling criterion can't cascade
+    this call's new rows away. It takes the lock here, not only in its caller, so a future direct
+    caller of this public function can't bypass it: the delete path's correctness depends on every
+    creator holding it. The caller must also hold the course run lock that
+    associate_competency_criterion() takes, so the dominance check below can't race another create,
+    and must take the Tag lock before the course run lock.
     """
+    # Re-acquiring the lock associate_competency_criterion() already holds is harmless within one transaction.
+    Tag.objects.select_for_update().get(pk=group.tag_id)
     tag = group.tag
     # tag.taxonomy_id is nullable at the model level; already guaranteed set by the caller.
     assert tag.taxonomy_id is not None
+    assert tag.taxonomy is not None
     _validate_containment(group, course_run)
 
-    existing_values = [existing_tag.value for existing_tag in get_object_tags(object_id, taxonomy_id=tag.taxonomy_id)]
-    if tag.value not in existing_values:
-        existing_values.append(tag.value)
-    try:
-        tag_object(object_id, tag.taxonomy, existing_values)
-    except ValueError as exc:
-        raise ValidationError({"object_id": str(exc)}) from exc
-    object_tag = ObjectTag.objects.get(object_id=object_id, taxonomy_id=tag.taxonomy_id, tag_id=tag.id)
+    object_tag = ObjectTag.objects.filter(object_id=object_id, taxonomy_id=tag.taxonomy_id, tag_id=tag.id).first()
+    if object_tag is None:
+        # These are the checks tag_object() applies when adding one tag, without its replace-the-list write.
+        if not tag.taxonomy.allow_multiple and ObjectTag.objects.filter(
+            object_id=object_id, taxonomy_id=tag.taxonomy_id,
+        ).exists():
+            raise ValidationError({
+                "object_id": _("Taxonomy ({name}) only allows one tag per object.").format(name=tag.taxonomy.name),
+            })
+        limit = tagging_api.OBJECT_MAX_TAGS
+        if ObjectTag.objects.filter(object_id=object_id).count() + 1 > limit:
+            raise ValidationError({
+                "object_id": _("Cannot add more than {limit} tags to ({object_id}).").format(
+                    object_id=object_id, limit=limit,
+                ),
+            })
+        object_tag = ObjectTag(taxonomy=tag.taxonomy, object_id=object_id, tag=tag)
+        object_tag.full_clean()
+        object_tag.save()
 
     if rule_profile_id is None and rule_type_override is None and rule_payload_override is None:
         profile = _get_applicable_rule_profile(tag.taxonomy_id)
@@ -484,9 +493,7 @@ def create_competency_criterion(
 
 def _reject_duplicate_criterion(tag: Tag, object_id: str, group_id: int | None) -> None:
     """
-    Raise ValidationError if an active criterion already associates ``object_id`` with ``tag``.
-
-    The check is scoped to ``group_id`` when supplied.
+    Raise ValidationError if ``object_id`` is already associated with ``tag`` (in ``group_id``, when supplied).
 
     Must run inside a transaction holding the tag row lock.
     """
@@ -496,8 +503,7 @@ def _reject_duplicate_criterion(tag: Tag, object_id: str, group_id: int | None) 
     ).first()
     if existing_object_tag is None:
         return
-    # An archived criterion keeps its ObjectTag for history; it must not block a fresh association.
-    duplicate_criteria = CompetencyCriterion.objects.filter(object_tag=existing_object_tag, archived=False)
+    duplicate_criteria = CompetencyCriterion.objects.filter(object_tag=existing_object_tag)
     if group_id is None:
         # Can't know which group slot is intended, so any existing criterion is a duplicate.
         if duplicate_criteria.exists():
@@ -564,10 +570,6 @@ def associate_competency_criterion(
     criterion, all inside one transaction so a downstream failure rolls back any group just
     created.
 
-    An archived leaf group (``group_id``) or an archived course-level group is rejected. When no
-    ``group_id`` is supplied, an archived root group is reactivated. An archived criterion doesn't
-    count as a duplicate.
-
     Raises ValidationError (never DRF's) on rejected input, including an invalid combination of
     rule fields or a missing or archived ``rule_profile_id``; Tag.DoesNotExist if ``tag_id``
     doesn't resolve to a competency tag; CompetencyCriteriaGroup.DoesNotExist if ``group_id``
@@ -593,7 +595,11 @@ def associate_competency_criterion(
 
     with transaction.atomic():
         # Lock order is always the tag, then the course run, so two creates can't deadlock.
-        # Serializes the duplicate check and root creation; MySQL has no partial unique index for one root per tag.
+        # The database enforces one root per tag; the tag lock serializes _reject_duplicate_criterion(). That
+        # check is check-then-act on both paths: without group_id a request always creates a fresh leaf, and with
+        # group_id CompetencyCriterion has no unique constraint on (object_tag, group), so no index catches a
+        # concurrent copy. delete_or_archive_competency_criterion() depends on this lock too: it keeps this
+        # function's inserts out of the delete's emptiness-check window.
         Tag.objects.select_for_update().get(pk=tag.pk)
         # Serializes the per-course dominance check on CBE's own row, not the catalog's CourseRun.
         # Created first, since a locking read of a row that doesn't exist yet locks nothing; get_or_create()
@@ -652,6 +658,11 @@ def _validate_rule_source(
         raise ValidationError(errors) from exc
 
 
+def _set_history_user(instance: Any, user: UserType) -> None:
+    """Record ``user`` as the author of ``instance``'s next history row; API callers have no request middleware."""
+    instance._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
+
+
 def _apply_rule_source(
     criterion: CompetencyCriterion,
     rule_profile_id: int | None,
@@ -686,8 +697,7 @@ def _apply_rule_source(
         return
 
     criterion.rule_profile_id, criterion.rule_type_override, criterion.rule_payload_override = target
-    # Set on the instance so attribution doesn't depend on simple_history's request middleware.
-    criterion._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
+    _set_history_user(criterion, user)
     criterion._change_reason = change_reason  # type: ignore[attr-defined]  # pylint: disable=protected-access
     # Never QuerySet.update(): it skips post_save, so simple_history would record nothing.
     criterion.save(update_fields=["rule_profile", "rule_type_override", "rule_payload_override"])
@@ -718,7 +728,7 @@ def bulk_update_competency_criteria(
     if any named id isn't a criterion of that group, and ValidationError, keyed by the REST field
     names, for a non-leaf group, an empty or repeated id list, or an invalid rule source. Raises
     CompetencyCriterionArchivedError if the group, either of its ancestors, or any named criterion
-    is archived.
+    is archived. Raises Tag.DoesNotExist if the group's competency tag was deleted concurrently.
     """
     with transaction.atomic():
         group = CompetencyCriteriaGroup.objects.select_related("tag__taxonomy", "parent__course").get(
@@ -727,7 +737,7 @@ def bulk_update_competency_criteria(
         # Criteria hang only off leaf groups, and a leaf's course is on its course-level parent.
         if group.parent is None or group.course_id is not None or group.parent.course is None:
             raise ValidationError({"group_id": _("group_id must reference a leaf CompetencyCriteriaGroup.")})
-        # A group's tag is always a competency tag, so its taxonomy is always set.
+        # The create path only accepts competency tags, and a group's tag never changes, so its taxonomy is set.
         assert group.tag.taxonomy is not None
         perm_obj = ObjectTagPermissionItem(taxonomy=group.tag.taxonomy, object_id=str(group.parent.course.course_key))
         if not user.has_perm("oel_tagging.can_tag_object", perm_obj):
@@ -739,13 +749,18 @@ def bulk_update_competency_criteria(
             raise ValidationError({"criterion_ids": _("criterion_ids must not name the same criterion twice.")})
         _validate_rule_source(rule_profile_id, rule_type_override, rule_payload_override)
 
+        # Every CBE authoring writer of a competency's criteria takes its Tag row lock first and no other row lock
+        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag, a Taxonomy
+        # or a CourseRun take the Tag row last, and can deadlock with a create or a hard delete: one side fails
+        # with a MySQL 1213 error and no data is corrupted. Everything below reads committed state, since a
+        # delete, an archive or a create for this competency can't commit while this transaction holds the lock.
+        # The reads above are safe without it because a group's tag, parent and course never change.
+        Tag.objects.select_for_update().get(pk=group.tag_id)
+
         # Archiving a group doesn't archive its criteria, yet ADR 0002 Decision 2 closes them to authoring.
         # An archived ancestor counts too: it stands in for a delete that would have cascaded to this leaf.
-        # Locked for the same reason as the criteria below.
         lineage = [group.id, group.parent.id, group.parent.parent_id]
-        archived_by_id = dict(
-            CompetencyCriteriaGroup.objects.select_for_update().filter(pk__in=lineage).values_list("pk", "archived")
-        )
+        archived_by_id = dict(CompetencyCriteriaGroup.objects.filter(pk__in=lineage).values_list("pk", "archived"))
         archived_group_id = next((pk for pk in lineage if archived_by_id.get(pk)), None)
         if archived_group_id is not None:
             raise CompetencyCriterionArchivedError(
@@ -754,9 +769,11 @@ def bulk_update_competency_criteria(
                 )
             )
 
-        # Locked so a concurrent archive can't slip in after the archived check, and so a concurrent
-        # identical request waits and then sees nothing to change instead of writing a second history row.
-        criteria_by_id = CompetencyCriterion.objects.select_for_update().filter(group=group).in_bulk(criterion_ids)
+        # No row lock here: the Tag lock already stops a concurrent archive from slipping in after the archived
+        # check, and makes a concurrent identical request wait and then see nothing to change instead of
+        # writing a second history row. Locking the lineage or the criteria as well would only add a second
+        # lock order for writers to deadlock on.
+        criteria_by_id = CompetencyCriterion.objects.filter(group=group).in_bulk(criterion_ids)
         missing_ids = [criterion_id for criterion_id in criterion_ids if criterion_id not in criteria_by_id]
         if missing_ids:
             raise CompetencyCriterion.DoesNotExist(
@@ -778,7 +795,10 @@ def bulk_update_competency_criteria(
         # every criterion in a leaf shares the group's tag, so they all resolve to the same profile.
         applicable = _get_applicable_rule_profile(group.tag.taxonomy.id) if rule_profile_id is None else None
         criteria = [criteria_by_id[criterion_id] for criterion_id in criterion_ids]
-        for criterion in criteria:
+        # Saves run in ascending primary-key order because the grading write inserts status rows in ascending
+        # criterion-pk order, and each insert takes an implicit shared foreign-key lock on its criterion row;
+        # a different order here could deadlock with it.
+        for criterion in sorted(criteria, key=lambda item: item.pk):
             _apply_rule_source(
                 criterion,
                 rule_profile_id,
@@ -803,24 +823,6 @@ def _effective_rule(criterion: CompetencyCriterion) -> tuple[str, Any]:
     return criterion.rule_type_override, criterion.rule_payload_override
 
 
-def _raise_leaf_status(user_id: int, criterion_id: int, status: MasteryStatus, now: datetime) -> int:
-    """
-    Create or raise a learner's leaf status row for one criterion; never lowers a stored status.
-
-    Returns the count of rows created or raised (0 or 1), matching the semantics of
-    ``QuerySet.update()``'s own return value.
-    """
-    row, created = StudentCompetencyCriterionStatus.objects.get_or_create(
-        user_id=user_id, criterion_id=criterion_id,
-        defaults={"status_id": status, "created": now, "modified": now},
-    )
-    if created:
-        return 1
-    return StudentCompetencyCriterionStatus.objects.filter(
-        pk=row.pk, status_id__lt=status,
-    ).update(status_id=status, modified=now)
-
-
 def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObjectScore]) -> int:
     """
     Record a learner's leaf-level competency status for each graded object in ``scores``.
@@ -838,6 +840,10 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
     status is only ever raised, never lowered. The return value is the count of leaf rows created or
     raised, where ``0`` means nothing changed. This function performs no authorization check of its
     own; as with ``openedx_tagging.api``, the caller is responsible for enforcing permissions.
+
+    Call this at most once per transaction. Its implicit criterion-row locks are taken in ascending
+    primary-key order within one call, and two calls in one transaction would form two ascending runs
+    that can deadlock with a concurrent bulk update.
 
     :raises TransactionManagementError: if called outside an atomic block.
     """
@@ -877,7 +883,12 @@ def record_graded_object_statuses(*, user_id: int, scores: Sequence[GradedObject
             )
             continue
         status = MasteryStatus.DEMONSTRATED if demonstrated else MasteryStatus.ATTEMPTED_NOT_DEMONSTRATED
-        changed += _raise_leaf_status(user_id, criterion.pk, status, now)
+        changed += raise_status(
+            StudentCompetencyCriterionStatus.objects,
+            lookup={"user_id": user_id, "criterion_id": criterion.pk},
+            status=status,
+            now=now,
+        )
 
     return changed
 
@@ -900,7 +911,7 @@ def update_competency_criteria_group(
     only for a real change. Learner status is never read or written.
 
     Raises CompetencyCriteriaGroup.DoesNotExist if no group has ``group_id``, or Tag.DoesNotExist
-    if its tag isn't on a CompetencyTaxonomy.
+    if its tag isn't on a CompetencyTaxonomy or was deleted concurrently.
     Raises ValidationError, keyed by the REST field names, for a root group, a group with no course
     anywhere above it to check permission against, or a ``logic_operator`` other than AND or OR, and
     PermissionDenied if ``user`` fails ``oel_tagging.can_tag_object`` for the group's taxonomy and
@@ -933,6 +944,12 @@ def update_competency_criteria_group(
         if not user.has_perm("oel_tagging.can_tag_object", perm_obj):  # type: ignore[arg-type]
             raise PermissionDenied
 
+        # The checks above read only a group's tag, parent and course, which never change, so they run before
+        # the lock and a caller who fails them never holds it.
+        Tag.objects.select_for_update().get(pk=tag.pk)
+        # Re-read under the Tag lock: a concurrent delete or archive may have won.
+        group = CompetencyCriteriaGroup.objects.select_related("course").get(pk=group_id)
+
         # Null is a stored state (a single-child group), but never one a caller may ask for.
         if logic_operator not in LogicOperator.values:
             raise ValidationError(
@@ -947,8 +964,7 @@ def update_competency_criteria_group(
             return group
 
         group.logic_operator = logic_operator
-        # Set on the instance so attribution doesn't depend on simple_history's request middleware.
-        group._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
+        _set_history_user(group, user)
         # Never QuerySet.update(): it skips post_save, so simple_history would record nothing.
         group.save(update_fields=["logic_operator"])
         return group
@@ -957,52 +973,46 @@ def update_competency_criteria_group(
 def _archive_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
     """Archive ``group``, writing only the flag and recording ``user`` in its history."""
     group.archived = True
-    # Set on the instance so attribution doesn't depend on simple_history's request middleware.
-    group._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
+    _set_history_user(group, user)
     group.save(update_fields=["archived"])
 
 
-def _cascade_from_group(group: CompetencyCriteriaGroup, event: Literal["delete", "archive"], user: UserType) -> None:
+def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
     """
-    Walk `group` and its ancestors, collapsing/archiving any left with no live children.
+    Walk ``group`` and its ancestors, deleting or archiving any left with no live children.
 
-    Checking both relations (`criteria` and `child_groups`) at every level is harmless: the one that
-    does not apply is an empty queryset, and it avoids a separate leaf/non-leaf code path.
-
-    An archived group is never written again: everything above it was handled when it was archived,
-    so a second write would only add a redundant history row. A delete event can still remove it. If
-    the delete left it with no criteria, no child groups and no group-level status, it is deleted and
-    the walk continues upward, so no empty group stays persisted. Otherwise the walk stops there.
+    An archived group is never saved again: everything above it was handled when it was archived,
+    so a second save would only add a redundant history row. If it has no criteria, no child groups
+    and no group-level status, it is deleted and the walk continues upward, so no empty group stays
+    persisted. Otherwise the walk stops there.
     """
     parent = group.parent
-    next_event: Literal["delete", "archive"]
     if group.archived:
-        if event == "archive" or group.criteria.exists() or group.child_groups.exists():
+        if group.criteria.exists() or group.child_groups.exists():
             return
         if _group_has_learner_progress(group.id):
             return
+        _set_history_user(group, user)
         group.delete()
         if parent is not None:
-            _cascade_from_group(parent, "delete", user)
+            _cascade_remove_from_group(parent, user)
         return
     has_live_child = (
         group.criteria.filter(archived=False).exists() or group.child_groups.filter(archived=False).exists()
     )
     if has_live_child:
         return
-    if event == "delete" and not group.criteria.exists() and not group.child_groups.exists():
+    if not group.criteria.exists() and not group.child_groups.exists():
         if _group_has_learner_progress(group.id):
             _archive_group(group, user)
-            next_event = "archive"
         else:
+            _set_history_user(group, user)
             group.delete()
-            next_event = "delete"
     else:
         # Only archived children remain.
         _archive_group(group, user)
-        next_event = "archive"
     if parent is not None:
-        _cascade_from_group(parent, next_event, user)
+        _cascade_remove_from_group(parent, user)
 
 
 def _write_criterion_archived(criterion: CompetencyCriterion, user: UserType) -> bool:
@@ -1014,8 +1024,7 @@ def _write_criterion_archived(criterion: CompetencyCriterion, user: UserType) ->
     if criterion.archived:
         return False
     criterion.archived = True
-    # Set on the instance so attribution doesn't depend on simple_history's request middleware.
-    criterion._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
+    _set_history_user(criterion, user)
     criterion.save(update_fields=["archived"])
     return True
 
@@ -1027,7 +1036,7 @@ def _archive_criterion(criterion: CompetencyCriterion, user: UserType) -> None:
     Does nothing if ``criterion`` is already archived, so a repeat call writes no history.
     """
     if _write_criterion_archived(criterion, user):
-        _cascade_from_group(criterion.group, "archive", user)
+        _cascade_remove_from_group(criterion.group, user)
 
 
 def _criterion_has_learner_progress(criterion_id: int) -> bool:
@@ -1042,51 +1051,81 @@ def _group_has_learner_progress(group_id: int) -> bool:
 
 def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) -> CriterionDeletionResult:
     """
-    Hard-delete `criterion_id`, or archive it if a learner status row already references it.
+    Hard-delete ``criterion_id``, or archive it if a learner status row already references it.
 
     UNSTABLE: the criteria-authoring family is incomplete, so its validation and group update
     and archive behavior may change this function's shape without a deprecation cycle.
 
-    ``user`` must hold ``oel_tagging.can_tag_object`` for the criterion's object, as
-    :func:`bulk_update_competency_criteria` requires; otherwise Django's ``PermissionDenied`` is
-    raised before anything is locked or changed.
+    ``user`` must hold ``oel_tagging.can_tag_object`` for the taxonomy of the criterion's group and for
+    the usage key its ``ObjectTag`` tags. The check runs before anything is locked or changed.
 
-    An ancestor :class:`CompetencyCriteriaGroup` left with no live children by this call is
-    cascaded in turn: hard-deleted if it carries no group-level status of its own, archived
-    otherwise. See ADR-0002 Decision 2.
-
-    Raises CompetencyCriterion.DoesNotExist if no such criterion exists (including one deleted
-    concurrently) and PermissionDenied if ``user`` may not tag the criterion's object.
+    An ancestor :class:`CompetencyCriteriaGroup` left with no live children by this call is cascaded in
+    turn: hard-deleted if it has no children of any kind and no group-level status of its own, archived
+    otherwise, including when only archived children remain. See ADR-0002 Decision 2.
 
     On a hard delete, the criterion's own ObjectTag is deleted too, and only when no other
     criterion references it. No other ObjectTag on the object is touched.
 
-    The whole operation runs in one transaction that locks only the competency's Tag, the same lock
-    a create for that competency takes first, so a concurrent create waits until this call commits.
+    Raises ``CompetencyCriterion.DoesNotExist`` if no such criterion exists (including one deleted
+    concurrently), ``Tag.DoesNotExist`` if its competency tag was deleted concurrently, Django's
+    ``PermissionDenied`` if ``user`` fails the permission check, and Django's ``ValidationError`` if
+    the archive path's ``full_clean()`` rejects an invalid stored rule payload.
+
+    The first read and the permission check run before the lock. The rest runs in one transaction that
+    takes only one explicit lock, on the competency's Tag row, the lock every CBE authoring writer of its
+    criteria takes first, so a concurrent create waits until this call commits. The lock is held until the
+    request commits, so other authoring writers for this competency, and inserts that reference its Tag
+    row, wait meanwhile.
+
+    The re-read under the lock and the ancestor walk's ``exists()`` checks rely on READ COMMITTED, the
+    isolation level this repo always runs (see ``AGENTS.md``): they must see concurrent commits.
+
+    A learner's grade saved at the same moment as a hard delete never loses data silently, but it can
+    fail one side with an error. The delete checks for a status row and then deletes the criterion, and a
+    grade write that inserts a status row in between is not waited for. There are three variants when
+    the grade is the one that gets in first:
+
+    - A status row committed before the status check: the delete archives the criterion, the normal path.
+    - A status row committed after the check and before ``criterion.delete()`` collects its rows:
+      ``ProtectedError``.
+    - A status row inserted but not yet committed when the delete runs: the delete waits for the grade
+      transaction, then fails the foreign-key check with ``IntegrityError``.
+
+    ``ProtectedError`` is a subclass of ``IntegrityError``. Either one rolls this transaction back and
+    leaves the criterion in place, and the REST view maps both to a retryable 409, since a second delete
+    archives the criterion. If the DELETE comes first instead, the grade's INSERT waits for it to commit
+    and then fails inside the learner's grade transaction.
     """
     criterion = CompetencyCriterion.objects.select_related("group__tag__taxonomy", "object_tag").get(pk=criterion_id)
-    # A group's tag is always a competency tag, so its taxonomy is always set.
+    # The create path only accepts competency tags, and a group's tag never changes, so its taxonomy is set.
     assert criterion.group.tag.taxonomy is not None
     perm_obj = ObjectTagPermissionItem(taxonomy=criterion.group.tag.taxonomy, object_id=criterion.object_tag.object_id)
-    # The rules-based permission takes an ObjectTagPermissionItem, but django-stubs types the
-    # has_perm object argument as a Model.
+    # has_perm()'s stub expects a Model, but a rules predicate takes any object.
     if not user.has_perm("oel_tagging.can_tag_object", cast(Any, perm_obj)):
         raise PermissionDenied()
     tag_id = criterion.group.tag_id
     with transaction.atomic():
+        # A lock rather than a constraint, because Django cascades deletes in Python and the database can't
+        # catch three races that follow. A create that commits a new leaf and criterion between the ancestor
+        # walk's emptiness check and the row-collecting SELECT inside ``group.delete()`` would have those rows
+        # deleted silently, after the create call already returned success. Two deletes of sibling criteria in
+        # one leaf would each still see the other's criterion and leave an empty leaf behind. A create that
+        # reuses the same ObjectTag and commits between the "still referenced" check and the ObjectTag delete
+        # would have its criterion cascaded away.
         Tag.objects.select_for_update().get(pk=tag_id)
         # Re-read under the Tag lock: a concurrent delete may have won; DoesNotExist propagates to the caller.
-        criterion = CompetencyCriterion.objects.get(pk=criterion_id)
+        criterion = CompetencyCriterion.objects.select_related("group", "object_tag").get(pk=criterion_id)
         if _criterion_has_learner_progress(criterion_id):
             _archive_criterion(criterion, user)
             return CriterionDeletionResult(id=criterion_id, archived=True)
         group = criterion.group
         object_tag = criterion.object_tag
+        _set_history_user(criterion, user)
         criterion.delete()
         # Only this criterion's own ObjectTag is a candidate, and only while no other criterion uses it.
         if not CompetencyCriterion.objects.filter(object_tag_id=object_tag.id).exists():
             ObjectTag.objects.filter(pk=object_tag.id).delete()
-        _cascade_from_group(group, "delete", user)
+        _cascade_remove_from_group(group, user)
         return CriterionDeletionResult(id=criterion_id, archived=False)
 
 
@@ -1150,7 +1189,7 @@ def _archive_competency_criteria_subtree(
     for criterion in criteria:
         _write_criterion_archived(criterion, user)
     if target_group.parent is not None:
-        _cascade_from_group(target_group.parent, "archive", user)
+        _cascade_remove_from_group(target_group.parent, user)
 
 
 def _subtree_has_learner_progress(group_ids: set[int], criterion_ids: list[int]) -> bool:
@@ -1198,10 +1237,17 @@ def delete_or_archive_competency_criteria_group(group_id: int, user: UserType) -
     a create or a criterion delete for that competency takes first, so those wait until this call
     commits.
 
+    A learner status written concurrently, after this call's progress check, makes the call
+    archive the subtree instead of deleting it, provided a second progress check finds a status on
+    the subtree. If it finds none, the failure came from outside the subtree, such as a status that
+    reached an ancestor group during the cascade, and the original ``IntegrityError`` is re-raised
+    with nothing changed. A caller may retry: the retry re-checks, then deletes or archives.
+
     Raises CompetencyCriteriaGroup.DoesNotExist if no such group exists (including one deleted
-    concurrently), PermissionDenied if ``user`` may not tag the course's object, and
-    ValidationError (keyed "group_id") if `group_id` names a root CompetencyCriteriaGroup or a
-    group with no course-level group in its lineage.
+    concurrently), Tag.DoesNotExist if its competency tag was deleted concurrently, PermissionDenied
+    if ``user`` may not tag the course's object, ValidationError (keyed "group_id") if `group_id`
+    names a root CompetencyCriteriaGroup or a group with no course-level group in its lineage, and
+    ``IntegrityError`` when the delete races with a write outside the target subtree.
     """
     group = CompetencyCriteriaGroup.objects.select_related("tag__taxonomy").get(pk=group_id)
     course = resolve_competency_criteria_group_course(group)
@@ -1214,23 +1260,40 @@ def delete_or_archive_competency_criteria_group(group_id: int, user: UserType) -
         raise PermissionDenied()
     tag_id = group.tag_id
     with transaction.atomic():
+        # The same lock associate_competency_criterion() takes first. Without it, a create could add a criterion
+        # to this subtree after it is read, or reuse an ObjectTag this call deletes as orphaned. The foreign keys
+        # would only turn either into an IntegrityError on one side, not order the two.
         Tag.objects.select_for_update().get(pk=tag_id)
         # Read under the Tag lock: a concurrent delete may have won, and DoesNotExist propagates.
         target_group = CompetencyCriteriaGroup.objects.get(pk=group_id)
         subtree_ids, criteria = _competency_criteria_subtree(target_group)
         criterion_ids = [criterion.pk for criterion in criteria]
-        has_progress = _subtree_has_learner_progress(subtree_ids, criterion_ids)
-        if has_progress:
+        archived = _subtree_has_learner_progress(subtree_ids, criterion_ids)
+        if not archived:
+            try:
+                # Savepoint: a learner status committed after the progress check above makes the delete
+                # fail on its PROTECT foreign key, and only this block must roll back.
+                with transaction.atomic():
+                    parent_group = target_group.parent
+                    _set_history_user(target_group, user)
+                    target_group.delete()
+                    _delete_orphaned_object_tags({criterion.object_tag_id for criterion in criteria})
+                    if parent_group is not None:
+                        _cascade_remove_from_group(parent_group, user)
+            except IntegrityError:
+                # Archive only if the failure traces to the subtree's own progress. A status on an ancestor
+                # group, or any other integrity failure, would not be fixed by archiving the subtree. The
+                # re-query is needed because the status may have landed after the pre-check above.
+                if not _subtree_has_learner_progress(subtree_ids, criterion_ids):
+                    raise
+                archived = True
+                # The rolled-back block may have cleared the pk of in-memory instances it had already deleted.
+                target_group = CompetencyCriteriaGroup.objects.get(pk=group_id)
+        if archived:
             _archive_competency_criteria_subtree(target_group, subtree_ids, criteria, user)
-        else:
-            parent_group = target_group.parent
-            target_group.delete()
-            _delete_orphaned_object_tags({criterion.object_tag_id for criterion in criteria})
-            if parent_group is not None:
-                _cascade_from_group(parent_group, "delete", user)
         return GroupDeletionResult(
             id=group_id,
-            archived=has_progress,
+            archived=archived,
             cascaded_group_count=len(subtree_ids) - 1,
             cascaded_criteria_count=len(criteria),
         )

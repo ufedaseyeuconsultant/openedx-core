@@ -4,6 +4,7 @@ Views for the CBE REST API, v1.
 from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError
 from django.db.models import QuerySet
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
@@ -167,7 +168,7 @@ class CompetencyCriterionBulkUpdateView(generics.GenericAPIView):
                 rule_payload_override=data.get("rule_payload_override"),
                 user=request.user,
             )
-        except (CompetencyCriteriaGroup.DoesNotExist, CompetencyCriterion.DoesNotExist) as exc:
+        except (CompetencyCriteriaGroup.DoesNotExist, CompetencyCriterion.DoesNotExist, Tag.DoesNotExist) as exc:
             raise NotFound(str(exc)) from exc
         except DjangoValidationError as exc:
             raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
@@ -276,7 +277,7 @@ class CompetencyCriteriaGroupDetailView(generics.GenericAPIView):
             group = update_competency_criteria_group(
                 group.id, logic_operator=serializer.validated_data["logic_operator"], user=request.user,
             )
-        except CompetencyCriteriaGroup.DoesNotExist as exc:
+        except (CompetencyCriteriaGroup.DoesNotExist, Tag.DoesNotExist) as exc:
             raise NotFound(str(exc)) from exc
         except DjangoValidationError as exc:
             raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
@@ -295,11 +296,18 @@ class CompetencyCriteriaGroupDetailView(generics.GenericAPIView):
         )
         try:
             result = delete_or_archive_competency_criteria_group(group.id, request.user)
-        except CompetencyCriteriaGroup.DoesNotExist as exc:
-            # Removed between the lookup above and the API call.
+        except (CompetencyCriteriaGroup.DoesNotExist, Tag.DoesNotExist) as exc:
+            # Removed between the lookup above and the API call, or while the call waited for the Tag lock.
             raise NotFound() from exc
         except DjangoValidationError as exc:
             raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        except IntegrityError as exc:
+            # ProtectedError is a subclass. The API archives a race on the target subtree's own progress itself, so
+            # this is a conflict it could not attribute to that subtree, such as a status that reached an ancestor
+            # group. A retry re-checks and then deletes or archives accordingly.
+            raise CompetencyCriteriaConflict(
+                _("The delete conflicted with a concurrent change. Retry the DELETE.")
+            ) from exc
         return Response(
             {
                 "id": result.id,
@@ -319,28 +327,28 @@ class CompetencyCriterionDeleteView(generics.GenericAPIView):
     oel_tagging.can_tag_object itself and raises Django's PermissionDenied, which becomes a 403.
     """
 
-    serializer_class = CompetencyCriterionSerializer
     authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
     permission_classes = [IsAuthenticated]
 
     def delete(self, request, *args, **kwargs):
         """
-        Resolve the criterion scoped to both path segments, then delegate to the public API, which checks permission.
+        Resolve the criterion by the `criterion_id` and `tag_id` in the URL, then delegate to the public API.
 
-        The URL is scoped by tag_id, not group_id, because its caller (#710) sends exactly
-        ``DELETE .../competencies/<tag_id>/criteria/<criterion_id>/`` and has no group id. The
-        lookup deliberately does not filter `archived=False`, so a repeat
-        DELETE against an already-archived row still resolves (200), and a mismatched tag_id or a
-        nonexistent criterion_id both 404 the same way, via this one get_object_or_404 call.
+        Archived rows still resolve, so a repeat DELETE on one returns 200.
         """
         criterion = get_object_or_404(
             CompetencyCriterion, pk=self.kwargs["criterion_id"], group__tag_id=self.kwargs["tag_id"],
         )
         try:
             result = delete_or_archive_competency_criterion(criterion.id, request.user)
-        except CompetencyCriterion.DoesNotExist as exc:
-            # Removed between the lookup above and the API call.
+        except (CompetencyCriterion.DoesNotExist, Tag.DoesNotExist) as exc:
+            # The criterion, or its competency tag, was removed between the lookup above and the API call.
             raise NotFound() from exc
         except DjangoValidationError as exc:
             raise DRFValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages) from exc
+        except IntegrityError as exc:
+            # ProtectedError is a subclass. A learner's grade write won the race, and a retry archives the criterion.
+            raise CompetencyCriteriaConflict(
+                _("A learner's progress was recorded against this criterion during the delete. Retry the DELETE.")
+            ) from exc
         return Response({"id": result.id, "archived": result.archived}, status=status.HTTP_200_OK)
