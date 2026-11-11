@@ -457,9 +457,10 @@ def create_competency_criterion(
     UNSTABLE: the criteria-authoring family is incomplete, so its validation and group update
     and archive behavior may change this function's shape without a deprecation cycle.
 
-    Adds only this competency's ObjectTag to the object, reusing it if it already exists. Other tags
-    on the object, including other competencies' tags in the same taxonomy, are never read or
-    changed, so a concurrent create or delete for another competency cannot be undone by this one.
+    Adds only this competency's ObjectTag to the object, reusing it if it already exists. An archived
+    association for the same object and tag is revived in place. Other tags on the object, including other
+    competencies' tags in the same taxonomy, are never read or changed, so a concurrent create or delete for
+    another competency cannot be undone by this one.
     Raises ValidationError (keyed "object_id") when the taxonomy allows one tag per object and the
     object already has a tag in it, or when the object is at the tag limit.
 
@@ -485,6 +486,12 @@ def create_competency_criterion(
     _validate_containment(group, course_run)
 
     object_tag = ObjectTag.objects.filter(object_id=object_id, taxonomy_id=tag.taxonomy_id, tag_id=tag.id).first()
+    if object_tag is not None and object_tag.archived:
+        # Revive the row instead of recreating it: the unique constraint allows one row per object and tag, and a
+        # new row would drop its deletion lock. Left archived, it would hide the tag and the new rule could
+        # never be evaluated.
+        object_tag.archived = False
+        object_tag.save(update_fields=["archived"])
     if object_tag is None:
         # These are the checks tag_object() applies when adding one tag, without its replace-the-list write.
         if not tag.taxonomy.allow_multiple and ObjectTag.objects.filter(
