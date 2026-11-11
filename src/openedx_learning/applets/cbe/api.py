@@ -624,10 +624,6 @@ def associate_competency_criterion(
     when no ``group_id`` is supplied. The error then says the association was archived, under the
     same ``object_id`` or ``group_id`` key as an active duplicate.
 
-    An archived leaf group (``group_id``) or an archived course-level group is rejected. When no
-    ``group_id`` is supplied, an archived root group is reactivated. An archived criterion doesn't
-    count as a duplicate.
-
     Raises ValidationError (never DRF's) on rejected input, including an invalid combination of
     rule fields or a missing or archived ``rule_profile_id``; Tag.DoesNotExist if ``tag_id``
     doesn't resolve to a competency tag; CompetencyCriteriaGroup.DoesNotExist if ``group_id``
