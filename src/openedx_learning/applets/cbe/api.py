@@ -488,8 +488,8 @@ def create_competency_criterion(
     object_tag = ObjectTag.objects.filter(object_id=object_id, taxonomy_id=tag.taxonomy_id, tag_id=tag.id).first()
     if object_tag is not None and object_tag.archived:
         # Revive the row instead of recreating it: the unique constraint allows one row per object and tag, and a
-        # new row would drop its deletion lock. Left archived, it would hide the tag and the new rule could
-        # never be evaluated.
+        # new row would not carry the archived row's deletion lock. Left archived, the row would hide the tag and
+        # the new rule could never be evaluated.
         object_tag.archived = False
         object_tag.save(update_fields=["archived"])
     if object_tag is None:
@@ -1298,7 +1298,7 @@ def _reconcile_object_tags(candidate_ids: set[int]) -> None:
     row locks the tagging layer takes during the lock and delete steps come after the ``Tag`` lock, so a
     concurrent ``record_graded_object_statuses()`` over overlapping associations can deadlock with this
     call. The database aborts one side with a deadlock error (MySQL 1213) and no data is corrupted, the
-    same class of risk that lock comment records.
+    same class of risk that the comment on the ``Tag`` lock in that function records.
     """
     if not candidate_ids:
         return
