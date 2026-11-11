@@ -3,11 +3,13 @@ Tests for the CBE public API surface (openedx_learning.api).
 """
 import re
 from collections.abc import Iterator
+from decimal import Decimal
 from typing import Any
 
 import pytest
 import rules
 from django.apps import apps
+from django.contrib.auth import get_user_model
 from django.core.exceptions import NON_FIELD_ERRORS, PermissionDenied, ValidationError
 from django.db import connection
 from django.db.utils import IntegrityError
@@ -21,14 +23,17 @@ from openedx_catalog.models import CatalogCourse, CourseRun
 from openedx_learning.api import (
     CompetencyCriteriaGroupArchivedError,
     CompetencyCriterionArchivedError,
+    GradedObjectScore,
     associate_competency_criterion,
     bulk_update_competency_criteria,
     create_competency_criterion,
     create_competency_taxonomy,
+    delete_or_archive_competency_criterion,
     get_competency_criteria_tree,
     get_competency_rule_profiles,
     get_courses_with_relative_criteria,
     is_competency_taxonomy,
+    record_graded_object_statuses,
     resolve_supplied_leaf_group,
     select_competency_taxonomies,
     update_competency_criteria_group,
@@ -47,6 +52,7 @@ from openedx_learning.models import (
     StudentCompetencyCriterionStatus,
     StudentCompetencyStatus,
 )
+from openedx_tagging.api import tag_object
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
 
 pytestmark = pytest.mark.django_db
@@ -786,6 +792,210 @@ def test_associate_competency_criterion_rolls_back_root_reactivation_when_the_do
     assert root.archived is True
     assert CompetencyCriteriaGroup.objects.count() == group_count
     assert CompetencyCriterion.objects.count() == criterion_count
+
+
+def _archive_a_locked_association(
+    user, tag: Tag, course_run: CourseRun,
+) -> tuple[CompetencyCriterion, CompetencyCriteriaGroup]:
+    """
+    Archive the association behind a criterion with learner progress, the way the product does.
+
+    Returns the archived criterion and an empty, active leaf under the same course-level group. A second
+    criterion on another object keeps the course-level group live, so the leaf stays a valid create target.
+    """
+    object_id = usage_key(course_run, "p1")
+    criterion = associate_competency_criterion(tag_id=tag.id, object_id=object_id)
+    associate_competency_criterion(tag_id=tag.id, object_id=usage_key(course_run, "p2"))
+    other_leaf = _create_leaf_group(tag, course_run)
+    record_graded_object_statuses(
+        user_id=user.id, scores=[GradedObjectScore(object_id=object_id, fraction=Decimal("0.9"))],
+    )
+    delete_or_archive_competency_criterion(criterion.id, user)
+    object_tag = ObjectTag.objects.get(pk=criterion.object_tag_id)
+    assert object_tag.archived is True
+    assert object_tag.deletion_locked is True
+    return criterion, other_leaf
+
+
+def test_recreating_a_rule_in_a_different_group_revives_the_archived_association(
+    user, tag: Tag, course_run: CourseRun,
+) -> None:
+    """
+    A new rule in another group reuses the archived association row and un-archives it, keeping the lock.
+
+    The old rule stays archived and is not touched.
+    """
+    old, other_leaf = _archive_a_locked_association(user, tag, course_run)
+    object_id = usage_key(course_run, "p1")
+
+    new = associate_competency_criterion(tag_id=tag.id, object_id=object_id, group_id=other_leaf.id)
+
+    assert new.object_tag_id == old.object_tag_id
+    row = ObjectTag.objects.get(pk=old.object_tag_id)
+    assert row.archived is False
+    assert row.deletion_locked is True
+    assert ObjectTag.objects.filter(object_id=object_id, tag=tag).count() == 1
+    assert CompetencyCriterion.objects.get(pk=old.pk).archived is True
+
+
+def test_recreating_a_rule_without_a_group_is_rejected_and_leaves_the_association_archived(
+    user, tag: Tag, course_run: CourseRun,
+) -> None:
+    """Without a group_id the archived rule blocks the create, so the association is not revived."""
+    old, _other_leaf = _archive_a_locked_association(user, tag, course_run)
+
+    with pytest.raises(ValidationError) as exc_info:
+        associate_competency_criterion(tag_id=tag.id, object_id=usage_key(course_run, "p1"))
+
+    assert "archived" in str(exc_info.value.message_dict["object_id"])
+    assert ObjectTag.objects.get(pk=old.object_tag_id).archived is True
+
+
+def test_recreating_a_rule_in_the_same_group_is_rejected_after_a_real_archive(
+    user, tag: Tag, course_run: CourseRun,
+) -> None:
+    """The archived rule's own group stays blocked after the real archive path, and the association stays archived."""
+    old, _other_leaf = _archive_a_locked_association(user, tag, course_run)
+
+    with pytest.raises(ValidationError) as exc_info:
+        associate_competency_criterion(
+            tag_id=tag.id, object_id=usage_key(course_run, "p1"), group_id=old.group_id,
+        )
+
+    assert "archived" in str(exc_info.value.message_dict["group_id"])
+    assert ObjectTag.objects.get(pk=old.object_tag_id).archived is True
+
+
+@pytest.mark.parametrize(
+    ("allow_multiple", "max_tags", "message"),
+    [
+        (False, None, "only allows one tag"),
+        (True, 1, "Cannot add more than 1 tags"),
+    ],
+    ids=["single_tag_taxonomy", "object_max_tags"],
+)
+def test_reviving_an_archived_association_respects_the_tag_limits(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    user,
+    course_run: CourseRun,
+    allow_multiple: bool,
+    max_tags: int | None,
+    message: str,
+) -> None:
+    """
+    Studio may tag the object with another competency while the first association is archived. Reviving the
+    first one then would exceed a limit (one tag in a single-tag taxonomy, or the per-object maximum), so the
+    create is rejected and the association stays archived.
+    """
+    taxonomy = create_competency_taxonomy(name="Limited", allow_multiple=allow_multiple, export_id="limited-v1")
+    first = make_tag(taxonomy, "T1")
+    make_tag(taxonomy, "T2")
+    old, other_leaf = _archive_a_locked_association(user, first, course_run)
+    object_id = usage_key(course_run, "p1")
+    if max_tags is not None:
+        # Lowered so one existing tag reaches the limit, instead of creating 100 rows.
+        monkeypatch.setattr("openedx_tagging.api.OBJECT_MAX_TAGS", max_tags)
+    tag_object(object_id, taxonomy, ["T2"])
+
+    with pytest.raises(ValidationError) as exc_info:
+        associate_competency_criterion(tag_id=first.id, object_id=object_id, group_id=other_leaf.id)
+
+    assert message in str(exc_info.value.message_dict["object_id"])
+    assert ObjectTag.objects.get(pk=old.object_tag_id).archived is True
+
+
+@pytest.mark.parametrize(
+    ("allow_multiple", "max_tags"),
+    [(False, None), (True, 1)],
+    ids=["single_tag_taxonomy", "object_max_tags"],
+)
+def test_archived_associations_do_not_count_toward_the_create_limits(
+    monkeypatch: pytest.MonkeyPatch, user, course_run: CourseRun, allow_multiple: bool, max_tags: int | None,
+) -> None:
+    """An archived association does not block a create for another tag, under either tag limit."""
+    taxonomy = create_competency_taxonomy(name="Limited", allow_multiple=allow_multiple, export_id="limited-v1")
+    first = make_tag(taxonomy, "T1")
+    second = make_tag(taxonomy, "T2")
+    old, _other_leaf = _archive_a_locked_association(user, first, course_run)
+    if max_tags is not None:
+        # Lowered so one archived tag would reach the limit, instead of creating 100 rows.
+        monkeypatch.setattr("openedx_tagging.api.OBJECT_MAX_TAGS", max_tags)
+
+    created = associate_competency_criterion(tag_id=second.id, object_id=usage_key(course_run, "p1"))
+
+    assert ObjectTag.objects.get(pk=created.object_tag_id).archived is False
+    assert ObjectTag.objects.get(pk=old.object_tag_id).archived is True
+
+
+def test_recreating_a_rule_after_studio_retagged_reuses_the_revived_row(
+    user, tag: Tag, course_run: CourseRun,
+) -> None:
+    """
+    When Studio re-applied the tag first, the association is already active and the new rule reuses that row.
+    """
+    old, other_leaf = _archive_a_locked_association(user, tag, course_run)
+    object_id = usage_key(course_run, "p1")
+    assert tag.taxonomy is not None
+    tag_object(object_id, tag.taxonomy, [tag.value])
+    assert ObjectTag.objects.get(pk=old.object_tag_id).archived is False
+
+    new = associate_competency_criterion(tag_id=tag.id, object_id=object_id, group_id=other_leaf.id)
+
+    assert new.object_tag_id == old.object_tag_id
+    row = ObjectTag.objects.get(pk=old.object_tag_id)
+    assert row.archived is False
+    assert row.deletion_locked is True
+    assert ObjectTag.objects.filter(object_id=object_id, tag=tag).count() == 1
+    assert CompetencyCriterion.objects.get(pk=old.pk).archived is True
+
+
+def test_a_revived_association_is_evaluated_for_the_new_rule_only(
+    user, tag: Tag, course_run: CourseRun,
+) -> None:
+    """
+    A learner's grade after the revive produces a status for the new rule and none for the archived one.
+
+    The first learner's status on the archived rule and the archived rule itself are left unchanged.
+    """
+    old, other_leaf = _archive_a_locked_association(user, tag, course_run)
+    object_id = usage_key(course_run, "p1")
+    first_status_before = StudentCompetencyCriterionStatus.objects.filter(user=user, criterion=old).values().get()
+    new = associate_competency_criterion(tag_id=tag.id, object_id=object_id, group_id=other_leaf.id)
+    second_learner = get_user_model().objects.create(username="second-learner")
+
+    record_graded_object_statuses(
+        user_id=second_learner.id, scores=[GradedObjectScore(object_id=object_id, fraction=Decimal("0.9"))],
+    )
+
+    statuses = StudentCompetencyCriterionStatus.objects.filter(user=second_learner)
+    assert set(statuses.values_list("criterion_id", flat=True)) == {new.pk}
+    assert not statuses.filter(criterion=old).exists()
+    first_status_after = StudentCompetencyCriterionStatus.objects.filter(user=user, criterion=old).values().get()
+    assert first_status_after == first_status_before
+    assert CompetencyCriterion.objects.get(pk=old.pk).archived is True
+
+
+def test_deleting_the_revived_rule_leaves_the_association_archived_and_locked(
+    user, tag: Tag, course_run: CourseRun,
+) -> None:
+    """
+    The revived rule has no learner progress and is hard-deleted. The association ends archived again, because the
+    old archived rule still references it, and stays locked from the earlier grade.
+    """
+    old, other_leaf = _archive_a_locked_association(user, tag, course_run)
+    new = associate_competency_criterion(
+        tag_id=tag.id, object_id=usage_key(course_run, "p1"), group_id=other_leaf.id,
+    )
+
+    result = delete_or_archive_competency_criterion(new.id, user)
+
+    assert result.archived is False
+    assert not CompetencyCriterion.objects.filter(pk=new.pk).exists()
+    assert CompetencyCriterion.objects.get(pk=old.pk).archived is True
+    row = ObjectTag.objects.get(pk=old.object_tag_id)
+    assert row.archived is True
+    assert row.deletion_locked is True
 
 
 # ==============================================================================================

@@ -2,6 +2,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +13,14 @@ from django.core.exceptions import PermissionDenied
 from django.db import transaction
 from rules.permissions import permissions as rule_permissions
 
-from openedx_learning.api import delete_or_archive_competency_criterion
+from openedx_catalog.models import CourseRun
+from openedx_learning.api import (
+    GradedObjectScore,
+    delete_or_archive_competency_criterion,
+    record_graded_object_statuses,
+)
 from openedx_learning.applets.cbe import api as cbe_api
+from openedx_learning.applets.cbe.api import _reconcile_object_tags
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -23,6 +30,7 @@ from openedx_learning.models import (
     StudentCompetencyCriteriaGroupStatus,
     StudentCompetencyCriterionStatus,
 )
+from openedx_tagging.api import get_object_tags, lock_object_tags_for_deletion
 from openedx_tagging.models import ObjectTag, Tag
 
 pytestmark = pytest.mark.django_db
@@ -80,15 +88,15 @@ def test_hard_delete_with_no_status_removes_the_row_and_its_object_tag(
 
 
 @pytest.mark.parametrize("shared_object_tag", [False, True], ids=["own object_tag", "shared object_tag"])
-def test_archive_path_leaves_the_row_and_its_object_tag_in_place(
+def test_archive_path_keeps_the_row_and_settles_its_object_tag(
     *,
     user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, now: datetime,
     shared_object_tag: bool,
 ) -> None:
     """
     Deleting a criterion that a learner status row already references archives it instead of
-    hard-deleting it: the row and its object_tag both survive, and archived=True comes back. Another
-    criterion on the same object_tag is left in place too.
+    hard-deleting it: the row and its object_tag both survive, and archived=True comes back. The
+    object_tag is archived when no other criterion uses it, and stays active when another one does.
     """
     group = CompetencyCriteriaGroup.objects.create(tag=tag)
     criterion = _make_criterion(group, object_tag, default_rule_profile)
@@ -105,10 +113,98 @@ def test_archive_path_leaves_the_row_and_its_object_tag_in_place(
     assert result.archived is True
     criterion.refresh_from_db()
     assert criterion.archived is True
-    assert ObjectTag.objects.filter(id=object_tag.id).exists()
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is not shared_object_tag
     if other is not None:
         other.refresh_from_db()
         assert other.archived is False
+
+
+def test_archiving_the_last_rule_archives_its_association(
+    user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    Archiving the only rule on an association archives the association too, so the assignment stops
+    showing the tag. The archived rule and the learner's status row survive and still point at it.
+    """
+    group = CompetencyCriteriaGroup.objects.create(tag=tag)
+    criterion = _make_criterion(group, object_tag, default_rule_profile)
+    record_graded_object_statuses(
+        user_id=user.id, scores=[GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.9"))],
+    )
+
+    result = delete_or_archive_competency_criterion(criterion.id, user)
+
+    assert result.archived is True
+    row = ObjectTag.objects.get(pk=object_tag.pk)
+    assert row.archived is True
+    assert not get_object_tags(object_tag.object_id).exists()
+    status = StudentCompetencyCriterionStatus.objects.get(criterion=criterion, user_id=user.id)
+    assert status.criterion.object_tag_id == object_tag.pk
+    assert status.criterion.object_tag.tag_id == tag.id
+
+
+def test_archiving_one_of_two_rules_on_an_association_leaves_it_active(
+    user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile, now: datetime,
+) -> None:
+    """An association another active rule still uses stays active when one of its rules is archived."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    leaf_a = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    leaf_b = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    first = _make_criterion(leaf_a, object_tag, default_rule_profile)
+    second = _make_criterion(leaf_b, object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=first, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    result = delete_or_archive_competency_criterion(first.id, user)
+
+    assert result.archived is True
+    first.refresh_from_db()
+    second.refresh_from_db()
+    assert first.archived is True
+    assert second.archived is False
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is False
+    assert [row.pk for row in get_object_tags(object_tag.object_id)] == [object_tag.pk]
+
+    # The remaining rule still records mastery on a grade, and the archived rule gains no status.
+    learner = get_user_model().objects.create(username="grade-after-archive")
+    record_graded_object_statuses(
+        user_id=learner.id, scores=[GradedObjectScore(object_id=object_tag.object_id, fraction=Decimal("0.9"))],
+    )
+    learner_statuses = StudentCompetencyCriterionStatus.objects.filter(user=learner)
+    assert set(learner_statuses.values_list("criterion_id", flat=True)) == {second.pk}
+    assert StudentCompetencyCriterionStatus.objects.filter(criterion=first).count() == 1
+
+
+def test_archiving_a_rule_whose_association_an_active_rule_in_another_course_uses_leaves_it(
+    *,
+    user, tag: Tag, course_run: CourseRun, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+    now: datetime,
+) -> None:
+    """
+    An active rule in another run of the same course keeps the association out of the lock step. The
+    status row is created directly so that no earlier lock exists to mask a wrong decision.
+    """
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    course_a = CompetencyCriteriaGroup.objects.create(tag=tag, course=course_run, parent=root)
+    leaf_a = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_a)
+    other_run = CourseRun.objects.create(catalog_course=course_run.catalog_course, run_code="Spring2027")
+    course_b = CompetencyCriteriaGroup.objects.create(tag=tag, course=other_run, parent=root)
+    leaf_b = CompetencyCriteriaGroup.objects.create(tag=tag, parent=course_b)
+    first = _make_criterion(leaf_a, object_tag, default_rule_profile)
+    second = _make_criterion(leaf_b, object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=first, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    result = delete_or_archive_competency_criterion(first.id, user)
+
+    assert result.archived is True
+    row = ObjectTag.objects.get(pk=object_tag.pk)
+    assert row.archived is False
+    assert row.deletion_locked is False
+    second.refresh_from_db()
+    assert second.archived is False
 
 
 def _latest_history_user(model_name: str, pk: int):
@@ -230,6 +326,152 @@ def test_hard_delete_removes_only_the_criterions_own_object_tag(
     assert not ObjectTag.objects.filter(id=object_tag.id).exists()
     assert CompetencyCriterion.objects.filter(id=other_criterion.id).exists()
     assert ObjectTag.objects.filter(id=other_object_tag.id).exists()
+
+
+def test_archive_leaves_another_competencys_object_tag_on_the_object_untouched(
+    *,
+    user,
+    competency_taxonomy: CompetencyTaxonomy,
+    tag: Tag,
+    object_tag: ObjectTag,
+    default_rule_profile: CompetencyRuleProfile,
+    now: datetime,
+) -> None:
+    """
+    An archive settles only the criterion's own ObjectTag. An ObjectTag for another competency on the same
+    object, with no criterion of its own (as Studio tagging creates it), stays active and unlocked.
+    """
+    other_tag = Tag.objects.create(taxonomy=competency_taxonomy, value="Reading Poetry")
+    other_object_tag = _make_object_tag(competency_taxonomy, other_tag, object_tag.object_id)
+    criterion = _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile)
+    StudentCompetencyCriterionStatus.objects.create(
+        user=user, criterion=criterion, status_id=MasteryStatus.DEMONSTRATED, created=now, modified=now,
+    )
+
+    result = delete_or_archive_competency_criterion(criterion.id, user)
+
+    assert result.archived is True
+    assert ObjectTag.objects.get(pk=object_tag.pk).archived is True
+    other_row = ObjectTag.objects.get(pk=other_object_tag.pk)
+    assert other_row.archived is False
+    assert other_row.deletion_locked is False
+
+
+# =================================================================================================
+# Reconciling the ObjectTags of removed criteria
+# =================================================================================================
+
+
+def _make_archived_criterion(
+    group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+) -> CompetencyCriterion:
+    """Create a CompetencyCriterion under `group` and archive it directly, bypassing the removal API."""
+    criterion = _make_criterion(group, object_tag, default_rule_profile)
+    criterion.archived = True
+    criterion.save()
+    return criterion
+
+
+def test_reconcile_leaves_an_association_an_active_criterion_uses(
+    tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """An association that an active criterion still uses is neither archived nor locked."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag, parent=root), object_tag, default_rule_profile)
+    _make_criterion(CompetencyCriteriaGroup.objects.create(tag=tag, parent=root), object_tag, default_rule_profile)
+
+    _reconcile_object_tags({object_tag.id})
+
+    row = ObjectTag.objects.get(pk=object_tag.pk)
+    assert row.archived is False
+    assert row.deletion_locked is False
+
+
+def test_reconcile_locks_and_archives_an_association_only_archived_criteria_use(
+    tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """An association used only by archived criteria is locked and archived, and the criterion row survives."""
+    criterion = _make_archived_criterion(
+        CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile
+    )
+
+    _reconcile_object_tags({object_tag.id})
+
+    row = ObjectTag.objects.get(pk=object_tag.pk)
+    assert row.archived is True
+    assert row.deletion_locked is True
+    assert CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
+
+
+def test_reconcile_deletes_an_association_nothing_references(
+    competency_taxonomy: CompetencyTaxonomy, tag: Tag,
+) -> None:
+    """An association no criterion references is deleted."""
+    orphan = _make_object_tag(competency_taxonomy, tag, "obj-orphan")
+
+    _reconcile_object_tags({orphan.id})
+
+    assert not ObjectTag.objects.filter(pk=orphan.pk).exists()
+
+
+def test_reconcile_is_idempotent_on_an_already_archived_association(
+    tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """Reconciling an association that is already locked and archived changes nothing, however often it runs."""
+    criterion = _make_archived_criterion(
+        CompetencyCriteriaGroup.objects.create(tag=tag), object_tag, default_rule_profile
+    )
+    lock_object_tags_for_deletion(object_tag.pk)
+    ObjectTag.objects.filter(pk=object_tag.pk).delete()
+
+    _reconcile_object_tags({object_tag.id})
+    _reconcile_object_tags({object_tag.id})
+
+    row = ObjectTag.objects.get(pk=object_tag.pk)
+    assert row.archived is True
+    assert row.deletion_locked is True
+    assert CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
+    assert ObjectTag.objects.filter(pk=object_tag.pk).count() == 1
+
+
+def test_reconcile_skips_an_id_that_no_longer_exists(
+    competency_taxonomy: CompetencyTaxonomy, tag: Tag, object_tag: ObjectTag,
+) -> None:
+    """An id with no ObjectTag row is skipped without an error, and the existing association is untouched."""
+    removed = _make_object_tag(competency_taxonomy, tag, "obj-removed")
+    removed_id = removed.id
+    removed.delete()
+
+    _reconcile_object_tags({removed_id})
+
+    row = ObjectTag.objects.get(pk=object_tag.pk)
+    assert row.archived is False
+    assert row.deletion_locked is False
+
+
+def test_hard_delete_of_a_rule_sharing_an_association_with_an_archived_rule_archives_it(
+    user, tag: Tag, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile,
+) -> None:
+    """
+    Hard-deleting the only live criterion on an association an archived criterion also uses archives the
+    association instead of deleting it, so the archived criterion row survives.
+    """
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    live = _make_criterion(
+        CompetencyCriteriaGroup.objects.create(tag=tag, parent=root), object_tag, default_rule_profile
+    )
+    archived = _make_archived_criterion(
+        CompetencyCriteriaGroup.objects.create(tag=tag, parent=root), object_tag, default_rule_profile
+    )
+
+    delete_or_archive_competency_criterion(live.id, user)
+
+    assert not CompetencyCriterion.objects.filter(pk=live.pk).exists()
+    archived.refresh_from_db()
+    assert archived.archived is True
+    row = ObjectTag.objects.get(pk=object_tag.pk)
+    assert row.archived is True
+    assert row.deletion_locked is True
 
 
 # =================================================================================================
