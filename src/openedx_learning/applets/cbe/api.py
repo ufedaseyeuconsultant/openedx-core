@@ -1312,13 +1312,12 @@ def delete_or_archive_competency_criteria_group(group_id: int, user: UserType) -
         raise PermissionDenied()
     tag_id = group.tag_id
     with transaction.atomic():
-        # A lock rather than a constraint, because Django cascades deletes in Python and the database can't
-        # catch the two races that follow. A create that commits a new criterion or leaf group into this
-        # subtree between the subtree read below and the row-collecting SELECT inside ``target_group.delete()``
-        # would have those rows deleted silently, since ``CompetencyCriterion.group`` cascades, after the create
-        # call already returned success. A create that reuses an ObjectTag this call deletes as orphaned, and
-        # commits between the "still referenced" check and the ObjectTag delete, would have its criterion
-        # cascaded away. Same lock associate_competency_criterion() takes first.
+        # Take the Tag lock that associate_competency_criterion() takes first, so no create for this
+        # competency runs while this delete does. Without the lock, a create could commit a criterion
+        # into this subtree after the subtree is read below, and target_group.delete() would
+        # cascade-delete that criterion after the create had returned success. A create could also
+        # reuse an ObjectTag at the moment this call deletes it as orphaned, and lose its new
+        # criterion the same way.
         Tag.objects.select_for_update().get(pk=tag_id)
         # Read under the Tag lock: a concurrent delete may have won, and DoesNotExist propagates.
         target_group = CompetencyCriteriaGroup.objects.get(pk=group_id)
