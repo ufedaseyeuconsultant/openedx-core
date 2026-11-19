@@ -146,6 +146,58 @@ def test_criterion_full_clean_rejects_invalid_override_payload(
         criterion.full_clean()
 
 
+def test_save_with_update_fields_validates_only_those_fields(
+    group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile
+) -> None:
+    """
+    A save limited to ``update_fields`` skips the field validation of every other field, including the foreign-key
+    lookups, while a full save() still rejects the same broken value.
+    """
+    criterion = CompetencyCriterion.objects.create(
+        group=group, object_tag=object_tag, rule_profile=default_rule_profile
+    )
+    criterion.rule_profile_id = 999_999_999  # No such profile; it is not part of this save.
+    criterion.archived = True
+
+    criterion.save(update_fields=["archived"])
+
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is True
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).rule_profile_id == default_rule_profile.pk
+    with pytest.raises(ValidationError):
+        criterion.save()
+
+
+def test_save_with_update_fields_naming_a_foreign_key_by_attname_validates_it(
+    group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile
+) -> None:
+    """``update_fields`` may name a foreign key by its attname, and that field is validated like any written field."""
+    criterion = CompetencyCriterion.objects.create(
+        group=group, object_tag=object_tag, rule_profile=default_rule_profile
+    )
+    criterion.rule_profile_id = 999_999_999  # No such profile.
+
+    with pytest.raises(ValidationError):
+        criterion.save(update_fields=["rule_profile_id"])
+
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).rule_profile_id == default_rule_profile.pk
+
+
+def test_save_with_update_fields_still_runs_clean(
+    group: CompetencyCriteriaGroup, object_tag: ObjectTag
+) -> None:
+    """clean() validates the override payload on every save, even when ``update_fields`` leaves it out."""
+    criterion = CompetencyCriterion.objects.create(
+        group=group, object_tag=object_tag, rule_type_override=RuleType.GRADE, rule_payload_override=_GRADE_PAYLOAD
+    )
+    criterion.rule_payload_override = {"op": "startswith", "value": 0.8, "scale": "percent"}
+    criterion.archived = True
+
+    with pytest.raises(ValidationError):
+        criterion.save(update_fields=["archived"])
+
+    assert CompetencyCriterion.objects.get(pk=criterion.pk).archived is False
+
+
 # ---------------------------------------------------------------------------------------------
 # History
 

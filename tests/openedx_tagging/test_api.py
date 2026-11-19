@@ -11,7 +11,7 @@ import pytest
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection
 from django.db.models import QuerySet
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
 import openedx_tagging.api as tagging_api
@@ -1512,6 +1512,16 @@ class TestApiTagging(TestTagTaxonomyMixin, TestCase):
         assert self.taxonomy.tag_set.count() == tag_count
 
 
+class _UnconfiguredAliasRouter:
+    """Sends every read and write to an unconfigured database alias, so a query that ignores ``using`` fails."""
+
+    def db_for_read(self, _model, **_hints):
+        return "replica"
+
+    def db_for_write(self, _model, **_hints):
+        return "replica"
+
+
 @ddt.ddt
 class TestDeletionLock(TestTagTaxonomyMixin, TestCase):
     """
@@ -1530,6 +1540,12 @@ class TestDeletionLock(TestTagTaxonomyMixin, TestCase):
         object_tag = self._tag("obj1")
         assert not self._is_locked(object_tag)
         tagging_api.lock_object_tags_for_deletion(object_tag.pk)
+        assert self._is_locked(object_tag)
+
+    def test_lock_runs_every_query_on_the_alias_it_is_given(self) -> None:
+        object_tag = self._tag("obj1")
+        with override_settings(DATABASE_ROUTERS=[_UnconfiguredAliasRouter()]):
+            tagging_api.lock_object_tags_for_deletion(object_tag.pk, using="default")
         assert self._is_locked(object_tag)
 
     def test_lock_is_idempotent(self) -> None:

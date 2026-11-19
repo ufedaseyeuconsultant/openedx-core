@@ -168,8 +168,13 @@ class CompetencyCriteriaGroup(models.Model):
             return
         # Queried rather than compared against a value cached at load time, so a deferred load or
         # a refresh_from_db() cannot bypass the check.
+        # On the database the instance was loaded from, so a caller that saves right after a write made there is
+        # not sent to a replica that has not seen it.
         persisted = (
-            CompetencyCriteriaGroup.objects.filter(pk=self.pk).values_list("tag_id", "parent_id", "course_id").first()
+            CompetencyCriteriaGroup.objects.using(self._state.db)
+            .filter(pk=self.pk)
+            .values_list("tag_id", "parent_id", "course_id")
+            .first()
         )
         if persisted is not None and (self.tag_id, self.parent_id, self.course_id) != persisted:
             raise ValidationError(
@@ -430,6 +435,21 @@ class CompetencyCriterion(models.Model):
             validate_rule_payload(self.rule_type_override, self.rule_payload_override)
 
     def save(self, *args, **kwargs):
-        """Persist this criterion, after full_clean() re-validates the override payload, if set."""
-        self.full_clean(validate_unique=False, validate_constraints=False)
+        """
+        Persist this criterion, after full_clean() re-validates the override payload, if set.
+
+        With ``update_fields``, only those fields are validated field by field.
+        """
+        update_fields = kwargs.get("update_fields")
+        exclude = None
+        if update_fields is not None:
+            # The fields that are not written are skipped because validating a foreign key reads its target through
+            # the database router, which can pick a different database than the one the caller is working on.
+            # Django accepts a field's name or its attname (``rule_profile_id``) in ``update_fields``.
+            exclude = [
+                field.name
+                for field in self._meta.fields
+                if field.name not in update_fields and field.attname not in update_fields
+            ]
+        self.full_clean(exclude=exclude, validate_unique=False, validate_constraints=False)
         super().save(*args, **kwargs)
