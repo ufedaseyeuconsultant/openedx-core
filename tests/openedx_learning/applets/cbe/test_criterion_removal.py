@@ -20,7 +20,7 @@ from openedx_learning.api import (
     record_graded_object_statuses,
 )
 from openedx_learning.applets.cbe import api as cbe_api
-from openedx_learning.applets.cbe.api import _reconcile_object_tags
+from openedx_learning.applets.cbe.api import _cascade_remove_from_group, _reconcile_object_tags
 from openedx_learning.models import (
     CompetencyCriteriaGroup,
     CompetencyCriterion,
@@ -820,3 +820,17 @@ def test_delete_leaves_an_emptied_archived_group_that_has_its_own_status(
 
     assert result.archived is False
     assert CompetencyCriteriaGroup.objects.filter(pk__in=[leaf.id, root.id], archived=True).count() == 2
+
+
+def test_cascade_with_no_user_records_a_history_row_with_no_author(tag: Tag) -> None:
+    """A cascade that no person caused writes its archive history row with a null history_user."""
+    root = CompetencyCriteriaGroup.objects.create(tag=tag)
+    leaf = CompetencyCriteriaGroup.objects.create(tag=tag, parent=root)
+    archived_child = CompetencyCriteriaGroup.objects.create(tag=tag, parent=leaf, archived=True)
+
+    _cascade_remove_from_group(leaf, None)
+
+    leaf.refresh_from_db()
+    assert leaf.archived is True
+    assert _latest_history_user("HistoricalCompetencyCriteriaGroup", leaf.id) is None
+    assert CompetencyCriteriaGroup.objects.filter(pk=archived_child.pk).exists()

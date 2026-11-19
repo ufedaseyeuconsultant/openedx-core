@@ -765,8 +765,12 @@ def _validate_rule_source(
         raise ValidationError(errors) from exc
 
 
-def _set_history_user(instance: Any, user: UserType) -> None:
-    """Record ``user`` as the author of ``instance``'s next history row; API callers have no request middleware."""
+def _set_history_user(instance: Any, user: UserType | None) -> None:
+    """
+    Record ``user`` as the author of ``instance``'s next history row; API callers have no request middleware.
+
+    ``None`` records a change no person caused, such as a cascade from a content or course deletion.
+    """
     instance._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
 
 
@@ -857,9 +861,9 @@ def bulk_update_competency_criteria(
         _validate_rule_source(rule_profile_id, rule_type_override, rule_payload_override)
 
         # Every CBE authoring writer of a competency's criteria takes its Tag row lock first and no other row lock
-        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag, a Taxonomy
-        # or a CourseRun take the Tag row last, and can deadlock with a create or a hard delete: one side fails
-        # with a MySQL 1213 error and no data is corrupted. Everything below reads committed state, since a
+        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag, a Taxonomy,
+        # a CourseRun or an ObjectTag take the Tag row last, and can deadlock with a create or a hard delete: one
+        # side fails with a MySQL 1213 error and no data is corrupted. Everything below reads committed state, since a
         # delete, an archive or a create for this competency can't commit while this transaction holds the lock.
         # The reads above are safe without it because a group's tag, parent and course never change.
         Tag.objects.select_for_update().get(pk=group.tag_id)
@@ -1088,14 +1092,14 @@ def update_competency_criteria_group(
         return group
 
 
-def _archive_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
+def _archive_group(group: CompetencyCriteriaGroup, user: UserType | None) -> None:
     """Archive ``group``, writing only the flag and recording ``user`` in its history."""
     group.archived = True
     _set_history_user(group, user)
     group.save(update_fields=["archived"])
 
 
-def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
+def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType | None) -> None:
     """
     Walk ``group`` and its ancestors, deleting or archiving any left with no live children.
 
@@ -1133,7 +1137,7 @@ def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType) -
         _cascade_remove_from_group(parent, user)
 
 
-def _write_criterion_archived(criterion: CompetencyCriterion, user: UserType) -> bool:
+def _write_criterion_archived(criterion: CompetencyCriterion, user: UserType | None) -> bool:
     """
     Archive ``criterion`` in place, recording ``user`` in its history, without cascading to its group.
 
@@ -1147,7 +1151,7 @@ def _write_criterion_archived(criterion: CompetencyCriterion, user: UserType) ->
     return True
 
 
-def _archive_criterion(criterion: CompetencyCriterion, user: UserType) -> None:
+def _archive_criterion(criterion: CompetencyCriterion, user: UserType | None) -> None:
     """
     Archive ``criterion`` in place and cascade the archive to any ancestor left with no live children.
 
