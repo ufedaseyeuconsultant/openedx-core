@@ -4,11 +4,11 @@ Signals sent by the tagging app.
 UNSTABLE: these signals are new, so their names and payloads may change without a deprecation cycle.
 
 Each signal is sent with ``send()`` as the last step of the transaction that archived the rows, so a receiver
-runs inside that transaction. The contract is the same for all three:
+runs inside that transaction unless it defers its reaction. The contract is the same for all three:
 
-- A receiver exception propagates to the caller and rolls back the archive.
-- A receiver whose effects are not transactional, such as enqueuing a Celery task or emitting an event, must defer
-  them with ``transaction.on_commit()``.
+- A receiver exception that is not caught propagates to the caller and rolls back the archive.
+- A receiver whose effects are not transactional, such as enqueuing a Celery task or emitting an event, or whose
+  failure must never roll back the archive, must defer its reaction with ``transaction.on_commit()``.
 - A receiver may be sent ids that it has already handled, so receivers must be idempotent. For ``tags_archived``,
   two concurrent requests that archive the same tag can each send its id. The ids can also arrive again when
   ``Taxonomy.delete_tags()`` makes another attempt, which it does when a receiver raises ``IntegrityError`` from
