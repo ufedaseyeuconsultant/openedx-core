@@ -29,6 +29,7 @@ from .data import TagDataQuerySet
 from .models import ObjectTag, Tag, Taxonomy
 from .models.base import ConcurrentDeleteError as _ConcurrentDeleteError
 from .models.base import _ConcurrentWrite, _retry_on_concurrent_write
+from .signals import taxonomies_archived
 
 # Export this as part of the API
 TagDoesNotExist = Tag.DoesNotExist
@@ -819,6 +820,9 @@ def delete_taxonomy(taxonomy: Taxonomy) -> None:
     passed in keeps its primary key, unlike after ``taxonomy.delete()``. Calling ``taxonomy.delete()`` directly
     skips this rule.
 
+    Archiving sends :data:`~openedx_tagging.signals.taxonomies_archived` inside the transaction that archives, and
+    only if the taxonomy was not already archived.
+
     :param taxonomy: The taxonomy to delete or archive.
     :raises ProtectedError: If the taxonomy has no deletion-locked association but another model still protects
         one of its tags from deletion.
@@ -829,10 +833,14 @@ def delete_taxonomy(taxonomy: Taxonomy) -> None:
     taxonomy_id = taxonomy.pk
     # This first check only saves work when the taxonomy is already known to be locked. The check that decides
     # is the one each delete attempt makes.
+    write_alias = router.db_for_write(Taxonomy)
     if not is_taxonomy_locked_for_deletion(taxonomy_id):
-        if _retry_on_concurrent_write(partial(_delete_taxonomy_unless_locked, taxonomy_id)):
+        if _retry_on_concurrent_write(partial(_delete_taxonomy_unless_locked, taxonomy_id), using=write_alias):
             return
-    Taxonomy.objects.filter(pk=taxonomy_id).update(archived=True)
+    with transaction.atomic(using=write_alias):
+        changed = Taxonomy.objects.using(write_alias).filter(pk=taxonomy_id, archived=False).update(archived=True)
+        if changed:
+            taxonomies_archived.send(sender=Taxonomy, taxonomy_ids=[taxonomy_id], using=write_alias)
     taxonomy.archived = True
 
 
