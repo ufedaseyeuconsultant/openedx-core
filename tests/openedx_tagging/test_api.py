@@ -17,9 +17,10 @@ from django.test.utils import CaptureQueriesContext
 import openedx_tagging.api as tagging_api
 from openedx_tagging.api import _get_current_tags as get_current_tags_unpatched
 from openedx_tagging.models import ObjectTag, Tag, Taxonomy
+from openedx_tagging.signals import object_tags_archived
 
 from .test_models import TestTagTaxonomyMixin, get_tag
-from .utils import concurrent_write, pretty_format_tags
+from .utils import concurrent_write, pretty_format_tags, received
 
 tag_values_for_autocomplete_test = [
     'Archaea',
@@ -1968,6 +1969,146 @@ class TestArchiveLockedObjectTags(TestTagTaxonomyMixin, TestCase):
         assert copied.is_copied is True
         assert copied.archived is False
         assert not ObjectTag.objects.filter(object_id="dest", _value="Chordata").exists()
+
+    @ddt.data("taxonomy", "free_text_taxonomy")
+    def test_copy_tags_unchanged_source_keeps_destination_rows_and_pks(self, taxonomy_attr: str) -> None:
+        taxonomy = getattr(self, taxonomy_attr)
+        self._apply("source", ["Mammalia", "Fungi"], taxonomy)
+        tagging_api.copy_tags("source", "dest")
+        locked = self._locked("dest", "Mammalia", taxonomy)
+        pks_before = set(ObjectTag.objects.filter(object_id="dest").values_list("pk", flat=True))
+        assert len(pks_before) == 2
+
+        with received(object_tags_archived) as calls:
+            tagging_api.copy_tags("source", "dest")
+
+        assert not calls
+        copied = ObjectTag.objects.filter(object_id="dest")
+        assert set(copied.values_list("pk", flat=True)) == pks_before
+        assert all(object_tag.is_copied and not object_tag.archived for object_tag in copied)
+        assert self._object_tag("dest", "Mammalia", taxonomy).deletion_locked is locked.deletion_locked
+
+    @ddt.data("taxonomy", "free_text_taxonomy")
+    def test_copy_tags_removes_only_the_copied_tags_the_source_dropped(self, taxonomy_attr: str) -> None:
+        taxonomy = getattr(self, taxonomy_attr)
+        self._apply("source", ["Mammalia", "Fungi", "Archaea"], taxonomy)
+        tagging_api.copy_tags("source", "dest")
+        if taxonomy is self.taxonomy:
+            self._apply("dest", ["System Tag 1"], self.read_only_taxonomy)
+        else:
+            self._apply("dest", ["Chordata"], self.taxonomy)
+        kept_pk = self._object_tag("dest", "Mammalia", taxonomy).pk
+        locked_dropped = self._locked("dest", "Fungi", taxonomy)
+        unlocked_dropped_pk = self._object_tag("dest", "Archaea", taxonomy).pk
+        non_copied = ObjectTag.objects.get(object_id="dest", is_copied=False)
+        ObjectTag.objects.filter(object_id="source", _value__in=["Fungi", "Archaea"]).delete()
+
+        with received(object_tags_archived) as calls:
+            tagging_api.copy_tags("source", "dest")
+
+        assert [call["object_tag_ids"] for call in calls] == [[locked_dropped.pk]]
+        assert self._object_tag("dest", "Mammalia", taxonomy).pk == kept_pk
+        assert ObjectTag.objects.get(pk=locked_dropped.pk).archived is True
+        assert not ObjectTag.objects.filter(pk=unlocked_dropped_pk).exists()
+        untouched = ObjectTag.objects.get(pk=non_copied.pk)
+        assert untouched.is_copied is False
+        assert untouched.archived is False
+
+    def test_copy_tags_removes_copied_tag_in_a_taxonomy_the_source_does_not_carry(self) -> None:
+        """
+        A free-text copy is dropped even when its value equals a free-text source value in another taxonomy.
+        """
+        other_taxonomy = tagging_api.create_taxonomy(name="Other Free Text", allow_free_text=True)
+        self._apply("source", ["Fungi"], self.free_text_taxonomy)
+        self._apply("other", ["Fungi"], other_taxonomy)
+        tagging_api.copy_tags("other", "dest")
+        foreign = self._locked("dest", "Fungi", other_taxonomy)
+
+        with received(object_tags_archived) as calls:
+            tagging_api.copy_tags("source", "dest")
+
+        assert [call["object_tag_ids"] for call in calls] == [[foreign.pk]]
+        assert ObjectTag.objects.get(pk=foreign.pk).archived is True
+        added = self._object_tag("dest", "Fungi", self.free_text_taxonomy)
+        assert added.is_copied is True
+        assert added.archived is False
+
+    def test_copy_tags_with_an_empty_source_removes_every_copied_tag(self) -> None:
+        self._apply("source", ["Mammalia", "Fungi"])
+        tagging_api.copy_tags("source", "dest")
+        locked = self._locked("dest", "Mammalia")
+        self._apply("dest", ["System Tag 1"], self.read_only_taxonomy)
+        non_copied_pk = ObjectTag.objects.get(object_id="dest", is_copied=False).pk
+        ObjectTag.objects.filter(object_id="source").delete()
+
+        with received(object_tags_archived) as calls:
+            tagging_api.copy_tags("source", "dest")
+
+        assert [call["object_tag_ids"] for call in calls] == [[locked.pk]]
+        assert set(ObjectTag.objects.filter(object_id="dest").values_list("pk", flat=True)) == {
+            locked.pk, non_copied_pk
+        }
+
+    def test_copy_tags_free_text_case_only_change_keeps_the_row_and_sends_no_signal(self) -> None:
+        self._apply("source", ["Fungi"], self.free_text_taxonomy)
+        tagging_api.copy_tags("source", "dest")
+        locked = self._locked("dest", "Fungi", self.free_text_taxonomy)
+        ObjectTag.objects.filter(object_id="source").update(_value="fungi")
+
+        with received(object_tags_archived) as calls:
+            tagging_api.copy_tags("source", "dest")
+
+        assert not calls
+        kept = ObjectTag.objects.get(object_id="dest")
+        assert kept.pk == locked.pk
+        assert kept.archived is False
+        assert kept.value == "fungi"
+
+    def test_copy_tags_still_adds_and_revives_new_source_tags(self) -> None:
+        self._apply("source", ["Mammalia", "Fungi"])
+        tagging_api.copy_tags("source", "dest")
+        archived = self._locked("dest", "Fungi")
+        ObjectTag.objects.filter(pk=archived.pk).update(archived=True)
+        self._apply("source", ["Mammalia", "Fungi", "Archaea"])
+
+        tagging_api.copy_tags("source", "dest")
+
+        revived = ObjectTag.objects.get(pk=archived.pk)
+        assert revived.archived is False
+        assert revived.is_copied is True
+        added = self._object_tag("dest", "Archaea")
+        assert added.is_copied is True
+        assert added.archived is False
+        assert ObjectTag.objects.filter(object_id="dest").count() == 3
+
+    @ddt.data("taxonomy", "free_text_taxonomy")
+    def test_copy_tags_leaves_the_copies_in_a_disabled_taxonomy_alone(self, taxonomy_attr: str) -> None:
+        """
+        The source hides the tags of a disabled taxonomy, which must not read as the source having dropped them.
+        """
+        taxonomy = getattr(self, taxonomy_attr)
+        enabled_taxonomy = self.free_text_taxonomy if taxonomy is self.taxonomy else self.taxonomy
+        self._apply("source", ["Mammalia", "Fungi"], taxonomy)
+        # A tag in another, enabled taxonomy keeps the source visible, so the sync matches against source tags.
+        self._apply("source", ["Archaea"], enabled_taxonomy)
+        tagging_api.copy_tags("source", "dest")
+        locked = self._locked("dest", "Mammalia", taxonomy)
+        unlocked_pk = self._object_tag("dest", "Fungi", taxonomy).pk
+        Taxonomy.objects.filter(pk=taxonomy.pk).update(enabled=False)
+        ObjectTag.objects.filter(object_id="source", _value="Fungi").delete()
+
+        with received(object_tags_archived) as calls:
+            tagging_api.copy_tags("source", "dest")
+
+        assert not calls
+        assert ObjectTag.objects.get(pk=locked.pk).archived is False
+        assert ObjectTag.objects.filter(pk=unlocked_pk).exists()
+
+        Taxonomy.objects.filter(pk=taxonomy.pk).update(enabled=True)
+        tagging_api.copy_tags("source", "dest")
+
+        assert ObjectTag.objects.get(pk=locked.pk).archived is False
+        assert not ObjectTag.objects.filter(pk=unlocked_pk).exists()
 
     @ddt.data("known_taxonomy", "no_taxonomy")
     def test_reimport_restores_unresolved_association(self, case: str) -> None:

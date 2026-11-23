@@ -20,7 +20,7 @@ from functools import partial
 from typing import Any, cast
 
 from django.db import models, router, transaction
-from django.db.models import F, QuerySet, Value
+from django.db.models import F, Q, QuerySet, Value
 from django.db.models.functions import Coalesce, Concat, Lower
 from django.utils.text import slugify
 from django.utils.translation import gettext as _
@@ -871,25 +871,43 @@ def copy_tags(source_object_id: str, dest_object_id: str):
     """
     Copy all tags from one object to another.
 
-    This keeps all not-copied tags and delete all
-    previous copied tags of the dest object.
+    This keeps all not-copied tags and removes the previously copied tags of the dest object that the source
+    no longer has. Copied tags that the source still has are updated in place, so they keep their rows.
     If there are not-copied tags that also are in 'source_object_id',
     then they become copied.
 
     Locked copied tags (``deletion_locked=True``) are archived instead of deleted. An archived destination
     tag that the source still has is restored, and takes the source's spelling of the value.
+
+    Copied tags in a disabled taxonomy are left as they are, because the source hides that taxonomy's tags.
     """
-    source_object_tags = get_object_tags(
-        source_object_id,
-    )
-    copied_tags = ObjectTag.objects.filter(
-        object_id=dest_object_id,
-        is_copied=True,
-    )
+    # A disabled taxonomy's tags are hidden from the source read below, which does not mean the source dropped them,
+    # so its copies are left as they are.
+    copied_tags = ObjectTag.objects.filter(object_id=dest_object_id, is_copied=True).exclude(taxonomy__enabled=False)
 
     with transaction.atomic():
-        # Delete all copied tags of destination
-        copied_tags.delete()
+        source_object_tags = list(get_object_tags(source_object_id))
+
+        if source_object_tags:
+            # A destination tag matches a source tag the same way the update_or_create() below looks it up: by tag
+            # id for closed tags, and by value for free-text ones. The database does the matching, so that value
+            # comparisons follow the column's collation, as the lookups below do.
+            matches_a_source_tag = Q()
+            for source_object_tag in source_object_tags:
+                if source_object_tag.tag_id:
+                    matches_a_source_tag |= Q(
+                        taxonomy_id=source_object_tag.taxonomy_id, tag_id=source_object_tag.tag_id
+                    )
+                else:
+                    matches_a_source_tag |= Q(
+                        taxonomy_id=source_object_tag.taxonomy_id, _value=source_object_tag.value
+                    )
+            dropped_object_tag_ids = list(copied_tags.exclude(matches_a_source_tag).values_list("pk", flat=True))
+        else:
+            dropped_object_tag_ids = list(copied_tags.values_list("pk", flat=True))
+        if dropped_object_tag_ids:
+            # Through the queryset's delete(), which archives locked tags instead of deleting them.
+            ObjectTag.objects.filter(pk__in=dropped_object_tag_ids).delete()
 
         # Copy an create object_tags in destination
         for source_object_tag in source_object_tags:
