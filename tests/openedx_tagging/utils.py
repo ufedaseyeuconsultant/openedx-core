@@ -10,6 +10,38 @@ from unittest.mock import patch
 
 from django.db import connection
 from django.db.models import Model, QuerySet
+from django.dispatch import Signal
+
+
+class WritesToPrimaryRouter:
+    """
+    Sends reads to a database alias that is not configured, and writes to ``default``.
+
+    A query that runs on the router's choice for reads instead of on the alias it was told to use fails.
+    """
+
+    def db_for_read(self, _model, **_hints):
+        return "replica"
+
+    def db_for_write(self, _model, **_hints):
+        return "default"
+
+
+@contextmanager
+def received(signal: Signal, sender: type | None = None) -> Iterator[list[dict[str, Any]]]:
+    """
+    Connect a throwaway receiver to ``signal`` and yield the list of keyword arguments of each send.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def receiver(**kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    signal.connect(receiver, sender=sender, weak=False, dispatch_uid=f"test-{id(receiver)}")
+    try:
+        yield calls
+    finally:
+        signal.disconnect(receiver, sender=sender, dispatch_uid=f"test-{id(receiver)}")
 
 
 @contextmanager

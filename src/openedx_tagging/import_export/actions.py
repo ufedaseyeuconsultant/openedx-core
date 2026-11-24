@@ -758,12 +758,21 @@ class DeleteTag(ImportAction):
 
     def execute(self) -> None:
         """
-        Delete a tag
+        Delete the tag, or archive it when a deletion-locked association depends on it.
+
+        Its subtags are deleted with it, or archived with it when a lock forces archival. A tag that is already
+        archived is left as it is.
         """
         try:
-            self._get_tag().delete()
+            tag = self._get_tag()
         except Tag.DoesNotExist:
-            pass  # The tag may be already cascade deleted if the parent tag was deleted
+            return  # Deleted earlier in this import, together with its parent.
+        if tag.archived:
+            # Archived earlier in this import, or before it: the plan leaves tags in an archived subtree out of
+            # the delete set (#927), so a tag archived before the import normally never reaches this point.
+            # A deletion-locked association on the tag, or on a tag beneath it, still holds it.
+            return
+        self.taxonomy.delete_tags([tag.value], with_subtags=True)
 
 
 class WithoutChanges(ImportAction):

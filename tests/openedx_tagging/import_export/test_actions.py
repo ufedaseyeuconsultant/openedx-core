@@ -1088,6 +1088,19 @@ class TestDeleteTag(TestImportActionMixin, TestCase):
         action.execute()
         assert not self.taxonomy.tag_set.filter(external_id=tag_id).exists()
 
+    def test_execute_leaves_an_archived_tag_in_place(self) -> None:
+        tag_id = 'tag_3'
+        self.taxonomy.tag_set.filter(external_id=tag_id).update(archived=True)
+        action = DeleteTag(
+            taxonomy=self.taxonomy,
+            tag=TagItem(id=tag_id, value='_'),
+            index=100,
+        )
+
+        action.execute()
+
+        assert self.taxonomy.tag_set.get(external_id=tag_id).archived
+
 
 class TestWithoutChanges(TestImportActionMixin, TestCase):
     """

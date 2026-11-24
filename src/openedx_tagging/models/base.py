@@ -19,6 +19,7 @@ from django.utils.translation import gettext_lazy as _
 from openedx_django_lib.fields import MultiCollationTextField, case_insensitive_char_field, case_sensitive_char_field
 
 from ..data import TagDataQuerySet
+from ..signals import object_tags_archived, tags_archived
 from .utils import RESERVED_TAG_CHARS, tag_external_id_candidate
 
 # Maximum depth of tags that can be created. Internally, the system has no depth limits, but for reasonable performance
@@ -99,6 +100,9 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
         tagging app depends on it. Archived object tags are counted as deleted in the result, so a caller can't tell
         which of the two happened.
 
+        Sends :data:`~openedx_tagging.signals.object_tags_archived` with the ids of the object tags this call
+        archived, other than ones that were already archived. It is sent last, inside the transaction.
+
         :return: Django's ``(total, {model_label: count})`` result, counting archived object tags as deleted.
         """
         # A model with a cascading foreign key to ObjectTag makes Django read the rows and then delete them by
@@ -116,12 +120,16 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
         write_database_object_tags = self.model.objects.using(database_alias)
 
         with transaction.atomic(using=database_alias):
-            deletion_locked_by_id = dict(row_locking_queryset.values_list("pk", "deletion_locked"))
             ids_to_archive = []
+            newly_archived_ids = []
             ids_to_delete = []
-            for object_tag_id, deletion_locked in deletion_locked_by_id.items():
+            for object_tag_id, deletion_locked, archived in row_locking_queryset.values_list(
+                "pk", "deletion_locked", "archived"
+            ):
                 if deletion_locked:
                     ids_to_archive.append(object_tag_id)
+                    if not archived:
+                        newly_archived_ids.append(object_tag_id)
                 else:
                     ids_to_delete.append(object_tag_id)
 
@@ -130,6 +138,10 @@ class ObjectTagQuerySet(models.QuerySet["ObjectTag"]):
             deleted_count, deleted_count_by_model = models.QuerySet.delete(
                 write_database_object_tags.filter(pk__in=ids_to_delete)
             )
+            if newly_archived_ids:
+                object_tags_archived.send(
+                    sender=ObjectTag, object_tag_ids=sorted(newly_archived_ids), using=database_alias
+                )
 
         self._result_cache = None
         return self._count_archived_as_deleted(archived_count, deleted_count, deleted_count_by_model)
@@ -417,9 +429,12 @@ class _ConcurrentWrite(Exception):
     """Raised inside a delete attempt that finds another transaction changed what it had read."""
 
 
-def _retry_on_concurrent_write(attempt: Callable[[], _T]) -> _T:
+def _retry_on_concurrent_write(attempt: Callable[[], _T], using: str | None = None) -> _T:
     """
     Run ``attempt`` in a transaction and return its result, trying again if a concurrent write got in its way.
+
+    ``using`` is the alias of the database the transaction is opened on. It is the alias the attempt writes to, so
+    that an error the attempt raises rolls back what it wrote. When it is ``None``, the default alias is used.
 
     An attempt writes first and then checks whether another transaction changed what it had read. If one did,
     or if the database refuses the delete, the attempt is rolled back and the next one reads the new state.
@@ -437,7 +452,7 @@ def _retry_on_concurrent_write(attempt: Callable[[], _T]) -> _T:
     while True:
         attempts_left -= 1
         try:
-            with transaction.atomic():
+            with transaction.atomic(using=using):
                 return attempt()
         except ProtectedError:
             raise
@@ -898,36 +913,44 @@ class Taxonomy(models.Model):
                 "delete_tags() doesn't work for read-only taxonomies. They cannot be modified."
             )
 
-        _retry_on_concurrent_write(partial(self._delete_or_archive_tags, tags, with_subtags))
+        write_alias = router.db_for_write(Tag, instance=self)
+        attempt = partial(self._delete_or_archive_tags, tags, with_subtags, write_alias)
+        _retry_on_concurrent_write(attempt, using=write_alias)
 
-    def _delete_or_archive_tags(self, tags: list[str], with_subtags: bool) -> None:
+    def _delete_or_archive_tags(self, tags: list[str], with_subtags: bool, using: str) -> None:
         """
-        Make one attempt at ``delete_tags()``. Needs a transaction.
+        Make one attempt at ``delete_tags()``. Needs a transaction on the alias ``using``, which the signal reports.
 
         The checks after the writes catch a tag or a deletion lock that another transaction added after the
         reads, and raise so that this attempt is rolled back and made again. They do not catch an association
         that already was deletion-locked without a tag and was relinked to one of these tags meanwhile.
+
+        Sends :data:`~openedx_tagging.signals.tags_archived` with the ids of the tags this attempt archived, other
+        than ones that were already archived, once the checks have passed.
         """
         removal = self._collect_subtrees(tags, with_subtags)
         locked = ObjectTag.objects.filter(tag_id__in=list(removal), deletion_locked=True)
         archive_ids, delete_roots = _split_archive_and_delete(removal, set(locked.values_list("tag_id", flat=True)))
+        # The removal includes tags that were already archived, which this attempt does not change.
+        newly_archived_ids = sorted(pk for pk in archive_ids if not removal[pk].archived)
         if archive_ids:
             self.tag_set.filter(id__in=archive_ids).update(archived=True)
         if not delete_roots:
             # With nothing to delete, the checks below have nothing to count, so the tags are collected again.
             if self._collect_subtrees(tags, with_subtags).keys() != removal.keys():
                 raise _ConcurrentWrite("Tags were added or removed beneath the tags being archived.")
-            return
-
-        # Deleting a tag clears the tag of its associations. A deletion-locked association in this taxonomy that
-        # has no tag after the delete, and had one before, is one this delete should have archived for.
-        orphaned = self.objecttag_set.filter(deletion_locked=True, tag__isnull=True)
-        orphaned_before = set(orphaned.values_list("pk", flat=True))
-        _total, deleted = self.tag_set.filter(id__in=delete_roots).delete()
-        if deleted.get(Tag._meta.label, 0) != len(removal) - len(archive_ids):
-            raise _ConcurrentWrite("Tags were added or removed beneath the tags being deleted.")
-        if orphaned.exclude(pk__in=orphaned_before).exists():
-            raise _ConcurrentWrite("A tag association was deletion-locked while its tag was being deleted.")
+        else:
+            # Deleting a tag clears the tag of its associations. A deletion-locked association in this taxonomy that
+            # has no tag after the delete, and had one before, is one this delete should have archived for.
+            orphaned = self.objecttag_set.filter(deletion_locked=True, tag__isnull=True)
+            orphaned_before = set(orphaned.values_list("pk", flat=True))
+            _total, deleted = self.tag_set.filter(id__in=delete_roots).delete()
+            if deleted.get(Tag._meta.label, 0) != len(removal) - len(archive_ids):
+                raise _ConcurrentWrite("Tags were added or removed beneath the tags being deleted.")
+            if orphaned.exclude(pk__in=orphaned_before).exists():
+                raise _ConcurrentWrite("A tag association was deletion-locked while its tag was being deleted.")
+        if newly_archived_ids:
+            tags_archived.send(sender=Tag, tag_ids=newly_archived_ids, using=using)
 
     def _collect_subtrees(self, tags: list[str], with_subtags: bool) -> dict[int, _RemovalTag]:
         """

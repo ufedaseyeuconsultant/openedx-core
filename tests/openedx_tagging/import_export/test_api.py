@@ -6,16 +6,20 @@ import json
 from collections.abc import Sequence
 from contextlib import contextmanager
 from io import BytesIO, StringIO
+from unittest import mock
 
 import ddt  # type: ignore[import]
 from django.db import transaction
 from django.test.testcases import TestCase
 
 import openedx_tagging.import_export.api as import_export_api
+from openedx_tagging import api as tagging_api
 from openedx_tagging.import_export import ParserFormat
 from openedx_tagging.import_export.import_plan import TagItem
 from openedx_tagging.models import ObjectTag, Tag, TagImportTask, TagImportTaskState, Taxonomy
+from openedx_tagging.signals import tags_archived
 
+from ..utils import received
 from .mixins import TestImportExportMixin
 
 
@@ -1691,3 +1695,123 @@ class TestImportAcceptanceScenarios(TestCase):
                     ],
                 )
                 assert log.count("is renamed to") == 1
+
+    def _lock(self, pks: dict[str, int], external_id: str) -> int:
+        """
+        Tag a content object with the tag and lock that association against deletion.
+        """
+        object_tag_pk = self._associate(pks, external_id)[pks[external_id]]
+        tagging_api.lock_object_tags_for_deletion(object_tag_pk)
+        return object_tag_pk
+
+    def test_import_replace_omitting_a_locked_tag_archives_it(self) -> None:
+        """
+        A replace import whose file omits a tag with a locked association completes, leaves the tag
+        archived with its association intact, and sends ``tags_archived`` with the tag's id.
+        """
+        pks = self._seed([TagItem(id="COMP-A", value="Alpha"), TagItem(id="COMP-B", value="Beta")])
+        object_tag_pk = self._lock(pks, "COMP-A")
+
+        with received(tags_archived, sender=Tag) as calls:
+            result, _log, _plan = self._import([TagItem(id="COMP-B", value="Beta")])
+
+        assert result
+        assert Tag.objects.get(pk=pks["COMP-A"]).archived is True
+        assert ObjectTag.objects.get(pk=object_tag_pk).tag_id == pks["COMP-A"]
+        assert Tag.objects.get(pk=pks["COMP-B"]).archived is False
+        assert [call["tag_ids"] for call in calls] == [[pks["COMP-A"]]]
+
+    def test_import_replace_omitting_an_unlocked_tag_still_deletes_it(self) -> None:
+        """
+        A replace import deletes an omitted tag that no locked association holds, and sends nothing.
+        """
+        pks = self._seed([TagItem(id="COMP-A", value="Alpha"), TagItem(id="COMP-B", value="Beta")])
+
+        with received(tags_archived) as calls:
+            result, _log, _plan = self._import([TagItem(id="COMP-B", value="Beta")])
+
+        assert result
+        assert not Tag.objects.filter(pk=pks["COMP-A"]).exists()
+        assert not calls
+
+    def test_import_replace_skips_a_tag_archived_by_an_earlier_run(self) -> None:
+        """
+        Importing the same file again leaves the archived tag untouched and sends nothing.
+        """
+        pks = self._seed([TagItem(id="COMP-A", value="Alpha"), TagItem(id="COMP-B", value="Beta")])
+        self._lock(pks, "COMP-A")
+        rows = [TagItem(id="COMP-B", value="Beta")]
+        assert self._import(rows)[0]
+
+        with received(tags_archived) as calls, mock.patch.object(
+            Taxonomy, "delete_tags", autospec=True
+        ) as delete_tags:
+            result, _log, _plan = self._import(rows)
+
+        assert result
+        delete_tags.assert_not_called()
+        assert Tag.objects.get(pk=pks["COMP-A"]).archived is True
+        assert not calls
+
+    def test_import_replace_keeps_an_unlocked_tag_that_is_already_archived(self) -> None:
+        """
+        A replace import that omits an archived tag no association holds leaves the row in place,
+        where a delete would remove it.
+        """
+        pks = self._seed([TagItem(id="COMP-A", value="Alpha"), TagItem(id="COMP-B", value="Beta")])
+        Tag.objects.filter(pk=pks["COMP-A"]).update(archived=True)
+
+        result, _log, _plan = self._import([TagItem(id="COMP-B", value="Beta")])
+
+        assert result
+        assert Tag.objects.get(pk=pks["COMP-A"]).archived is True
+
+    def test_import_replace_omitting_a_parent_and_child_together_succeeds(self) -> None:
+        """
+        Omitting a parent and its child together succeeds: the child's locked association archives
+        both, and without a lock both are deleted.
+        """
+        rows = [TagItem(id="COMP-P", value="Parent"), TagItem(id="COMP-K", value="Kid", parent_id="COMP-P")]
+        kept = [TagItem(id="COMP-B", value="Beta")]
+        pks = self._seed(rows + kept)
+        self._lock(pks, "COMP-K")
+
+        with received(tags_archived) as calls:
+            result, _log, _plan = self._import(kept)
+
+        assert result
+        assert Tag.objects.get(pk=pks["COMP-P"]).archived is True
+        assert Tag.objects.get(pk=pks["COMP-K"]).archived is True
+        assert sorted(tag_id for call in calls for tag_id in call["tag_ids"]) == sorted(
+            [pks["COMP-P"], pks["COMP-K"]]
+        )
+
+        with self.subTest(locked=False):
+            plain_pks = self._seed(
+                [TagItem(id="COMP-Q", value="Quark"), TagItem(id="COMP-R", value="Rho", parent_id="COMP-Q")] + kept
+            )
+            with received(tags_archived) as calls:
+                result, _log, _plan = self._import(kept)
+            assert result
+            assert not Tag.objects.filter(pk__in=[plain_pks["COMP-Q"], plain_pks["COMP-R"]]).exists()
+            assert not calls
+
+    def test_import_replace_propagates_a_delete_tags_failure(self) -> None:
+        """
+        An exception from ``delete_tags()`` fails the import and is recorded on the task, whatever its type.
+        """
+        pks = self._seed([TagItem(id="COMP-A", value="Alpha"), TagItem(id="COMP-B", value="Beta")])
+        rows = [TagItem(id="COMP-B", value="Beta")]
+
+        for error in (ValueError("delete_tags boom"), Tag.DoesNotExist("delete_tags boom")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(Taxonomy, "delete_tags", side_effect=error):
+                    result, task, plan = import_export_api.import_tags(
+                        self.taxonomy, self._render(rows, ParserFormat.JSON), ParserFormat.JSON, replace=True,
+                    )
+
+                assert not result
+                assert plan is None
+                assert task.status == TagImportTaskState.ERROR.value
+                assert "delete_tags boom" in task.log
+                assert Tag.objects.filter(pk=pks["COMP-A"]).exists()
