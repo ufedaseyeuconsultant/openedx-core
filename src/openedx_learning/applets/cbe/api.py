@@ -1333,22 +1333,28 @@ def _archive_competency_criteria_subtree(
     using: str | None = None,
 ) -> None:
     """
-    Archive every group and criterion in the subtree, reconcile the subtree's associations, then cascade above it.
+    Archive every group and criterion in the subtree, reconcile the archived criteria's associations, then cascade up.
 
     ``user`` is recorded in the history of every row written. With ``None``, ``simple_history`` picks the author:
     the request user when a request is in progress, otherwise nobody.
     ``using`` is a database alias to read and write on.
+
+    Only the associations of the criteria this call archives are reconciled. A criterion that was already archived
+    had its association reconciled then, and the association may have been revived by tagging the object again,
+    which a later archive of its group must not undo.
     """
     # The criteria are written without #674's per-criterion cascade: every group in the subtree is archived
-    # here, and the one upward walk below covers the target's ancestors. The subtree's associations are
-    # reconciled after the archive, so an assignment nothing measures stops showing the tag.
+    # here, and the one upward walk below covers the target's ancestors. The associations of the criteria written
+    # are reconciled after the archive, so an assignment nothing measures stops showing the tag.
     for group in CompetencyCriteriaGroup.objects.using(using).filter(id__in=all_group_ids, archived=False):
         _archive_group(group, user, using)
-    for criterion in criteria:
-        _write_criterion_archived(criterion, user, using)
-    _reconcile_object_tags({criterion.object_tag_id for criterion in criteria}, using)
-    if target_group.parent is not None:
-        _cascade_remove_from_group(target_group.parent, user, using)
+    written_object_tag_ids = {
+        criterion.object_tag_id for criterion in criteria if _write_criterion_archived(criterion, user, using)
+    }
+    _reconcile_object_tags(written_object_tag_ids, using)
+    parent = _parent_group(target_group, using)
+    if parent is not None:
+        _cascade_remove_from_group(parent, user, using)
 
 
 def _subtree_has_learner_progress(group_ids: set[int], criterion_ids: list[int]) -> bool:
@@ -1425,9 +1431,11 @@ def delete_or_archive_competency_criteria_group(group_id: int, user: UserType) -
     if any does. Either way, each ancestor left with no live children is then hard-deleted or
     archived, as for a criterion delete (ADR-0002 Decision 2).
 
-    Only the associations (ObjectTag) of the subtree's criteria are touched, hard delete or archive alike, and
-    each is kept while an active criterion uses it, archived when only archived criteria do, and otherwise
-    deleted, or archived if it was already locked; no other association on the object is changed.
+    Only the associations (ObjectTag) of the subtree's criteria are touched. On a hard delete, each one is kept
+    while an active criterion uses it, archived when only archived criteria do, and otherwise deleted, or archived
+    if it was already locked. On an archive, the same rule applies to the associations of the criteria this call
+    archives. The association of a criterion that was already archived is left as it is, including one revived by
+    tagging the content again. No other association on the object is changed.
 
     The first read and the permission check run before the lock. The rest runs in one transaction that
     takes only one explicit lock, on the competency's Tag row, the same lock a create or a criterion
