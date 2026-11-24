@@ -99,29 +99,28 @@ def test_deleting_a_rule_profile_referenced_by_a_criterion_raises_restricted_err
     assert any(isinstance(obj, CompetencyCriterion) and obj.pk == criterion.pk for obj in restricted)
 
 
-def test_object_tag_delete_leaves_a_childless_criteria_group_behind(
-    group: CompetencyCriteriaGroup, object_tag: ObjectTag, default_rule_profile: CompetencyRuleProfile
+def test_object_tag_delete_removes_the_criteria_group_it_leaves_empty(
+    group: CompetencyCriteriaGroup,
+    object_tag: ObjectTag,
+    default_rule_profile: CompetencyRuleProfile,
+    django_capture_on_commit_callbacks,
 ) -> None:
     """
-    Deleting an ObjectTag cascades away the CompetencyCriterion that references it, but leaves the
-    CompetencyCriteriaGroup that housed that criterion in place, even when the group now has no
-    children of any kind.
-
-    This is deliberate, not a bug: CompetencyCriteriaGroup has no foreign key to ObjectTag, so
-    nothing about this delete gives Django's collector a reason to reach the group. Cleaning up a
-    now-childless group is authoring-API/application-layer work, not something an on_delete value
-    can express here.
+    Deleting an ObjectTag cascades away the CompetencyCriterion that references it. CompetencyCriteriaGroup
+    has no foreign key to ObjectTag, so Django's collector never reaches the group; the post_delete receiver
+    in signal_handlers.py removes the group instead, after the delete commits.
     """
     criterion = CompetencyCriterion.objects.create(
         group=group, object_tag=object_tag, rule_profile=default_rule_profile
     )
     assert CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
 
-    object_tag.delete()
+    # The receiver cleans up after the delete commits; the test transaction never commits, so run it here.
+    with django_capture_on_commit_callbacks(execute=True):
+        object_tag.delete()
 
     assert not CompetencyCriterion.objects.filter(pk=criterion.pk).exists()
-    assert CompetencyCriteriaGroup.objects.filter(pk=group.pk).exists()
-    assert not CompetencyCriteriaGroup.objects.get(pk=group.pk).criteria.exists()
+    assert not CompetencyCriteriaGroup.objects.filter(pk=group.pk).exists()
 
 
 # ---------------------------------------------------------------------------------------------

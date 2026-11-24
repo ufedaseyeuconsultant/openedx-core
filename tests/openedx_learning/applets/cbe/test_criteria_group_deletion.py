@@ -51,13 +51,14 @@ def test_deleting_a_tag_also_deletes_its_competency_criteria_groups(tag: Tag, gr
 
 
 def test_deleting_a_course_run_also_deletes_its_course_scoped_criteria_groups(
-    tag: Tag, course_run: CourseRun
+    tag: Tag, course_run: CourseRun, django_capture_on_commit_callbacks
 ) -> None:
     """
     Deleting a CourseRun cascades to any CompetencyCriteriaGroup scoped to it via `course`, and
     through that group's `parent` CASCADE to the leaf groups under it: the delete succeeds, the
-    course-level group and leaf rows are gone, and the root above them stays. A course-scoped
-    subtree has no meaning once the course run it evaluates against no longer exists.
+    course-level group and leaf rows are gone, and the root above them is removed by the cleanup
+    listener, after the delete commits, once nothing is left beneath it. A course-scoped subtree has no meaning once the
+    course run it evaluates against no longer exists.
 
     `course` is a nullable cascading foreign key. MySQL cannot defer foreign-key constraint
     checks, so Django's collector nulls such a key before the DELETE; SQLite never does. A
@@ -70,10 +71,12 @@ def test_deleting_a_course_run_also_deletes_its_course_scoped_criteria_groups(
     group_pks = [group.pk, *(leaf.pk for leaf in leaves)]
     assert CompetencyCriteriaGroup.objects.filter(pk__in=group_pks).count() == 3
 
-    course_run.delete()
+    # The cleanup listener runs after the delete commits; the test transaction never commits, so run it here.
+    with django_capture_on_commit_callbacks(execute=True):
+        course_run.delete()
 
     assert not CompetencyCriteriaGroup.objects.filter(pk__in=group_pks).exists()
-    assert CompetencyCriteriaGroup.objects.filter(pk=root.pk).exists()
+    assert not CompetencyCriteriaGroup.objects.filter(pk=root.pk).exists()
 
 
 def test_deleting_a_group_at_depth_also_deletes_every_descendant_group(tag: Tag) -> None:

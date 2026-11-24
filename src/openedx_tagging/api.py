@@ -934,7 +934,7 @@ def _lost_tag_or_taxonomy(before: ObjectTag, after: ObjectTag) -> bool:
     return lost_tag or lost_taxonomy
 
 
-def lock_object_tags_for_deletion(object_tag_ids: int | Iterable[int]) -> None:
+def lock_object_tags_for_deletion(object_tag_ids: int | Iterable[int], *, using: str | None = None) -> None:
     """
     Lock the given ObjectTags against deletion.
 
@@ -946,6 +946,8 @@ def lock_object_tags_for_deletion(object_tag_ids: int | Iterable[int]) -> None:
     deadlock.
 
     :param object_tag_ids: One ObjectTag primary key, or an iterable of them.
+    :param using: The alias of the database to read and write on, for a caller reacting to a write made there. By
+        default Django's router chooses.
     :raises TypeError: If any id is not an int. Strings, bytes, and bools are not coerced.
     :raises ObjectTagDoesNotExist: If any id does not resolve to an ObjectTag, or if an ObjectTag, its tag, or its
         taxonomy is deleted while this function runs. Nothing is locked in that case.
@@ -953,17 +955,18 @@ def lock_object_tags_for_deletion(object_tag_ids: int | Iterable[int]) -> None:
     ids = _extract_object_tag_ids(object_tag_ids)
     if not ids:
         return
-    before = ObjectTag.objects.only("deletion_locked", "tag", "taxonomy").in_bulk(ids)
+    object_tags = ObjectTag.objects.using(using)
+    before = object_tags.only("deletion_locked", "tag", "taxonomy").in_bulk(ids)
     missing = ids - before.keys()
     if missing:
         raise ObjectTag.DoesNotExist(f"ObjectTag ids not found: {sorted(missing)}")
     unlocked = [pk for pk, object_tag in before.items() if not object_tag.deletion_locked]
     if unlocked:
-        with transaction.atomic():
+        with transaction.atomic(using=using):
             # This update waits for a concurrent delete of the row, its tag, or its taxonomy to finish, so what
             # that delete did is read afterwards. Another caller locking the row first is not an error.
-            ObjectTag.objects.filter(pk__in=unlocked, deletion_locked=False).update(deletion_locked=True)
-            after = ObjectTag.objects.only("tag", "taxonomy").in_bulk(unlocked)
+            object_tags.filter(pk__in=unlocked, deletion_locked=False).update(deletion_locked=True)
+            after = object_tags.only("tag", "taxonomy").in_bulk(unlocked)
 
             deleted = set(unlocked) - after.keys()
             if deleted:

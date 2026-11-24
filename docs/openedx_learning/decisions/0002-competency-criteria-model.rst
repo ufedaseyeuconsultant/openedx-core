@@ -109,6 +109,19 @@ Decision
    Boundaries and intended behavior:
 
    - Empty groups: Persisted criteria definitions should not contain empty groups. Authoring flows may temporarily create empty groups while editing, but backend validation must reject them.
+
+     The authoring API keeps this rule synchronously: it removes or archives a group in the same transaction as
+     the change that empties it. A deletion that starts outside CBE, such as the tagging layer deleting an
+     ``ObjectTag`` or the catalog deleting a ``CourseRun``, triggers the same cleanup through CBE's own delete
+     receivers, filtered by the origin of the deletion. The cleanup runs after that deletion commits, in a
+     transaction of its own, and is best-effort. An empty group can therefore exist briefly. If the cleanup fails,
+     the empty group stays in place, and the failure is logged with the ids of the groups left behind, until
+     something removes them. Readers must tolerate an empty group, and Decision 6's rollup already does: a group
+     whose children have no status has no status. The cleanup runs after the commit for two reasons. A failed
+     cleanup must never undo a content deletion that the platform cannot retry. And inside the deletion's
+     transaction the cleanup would take the competency's ``Tag`` lock after the deletion's own row locks, while
+     every authoring writer takes the ``Tag`` lock first: two lock orders that can deadlock. Deferred, the
+     cleanup takes the ``Tag`` lock first too, in the same order as every writer.
    - Mixed tree depths: Backend supports deeply nested groups. Current frontend authoring constraint is a maximum depth of 3 layers total, using zero-indexed depth (``0=root``, ``1=course-scope group``, ``2=leaf criteria/group``).
    - Retrieval scope: A read always includes the root group, plus any selected subset of course-scoped groups, each returned as a complete subtree, never truncated.
    - Practical size and growth: Total rows in ``CompetencyCriteriaGroup`` are expected to grow over time as course runs are added; this ADR sets no global DB row cap. No max total node-count cap is required per root group. Each course-scoped subtree is expected to stay small (realistically <=500 nodes).
@@ -507,3 +520,10 @@ Changelog
 
 * Decision 4 states that no ancestor or descendant of a competency tag may hold live criteria
   in the same course as that tag, and why.
+
+2026-11-24:
+
+* Amended Decision 2's empty-groups rule for issue #895. The authoring API still never persists an empty
+  group. A deletion that starts outside CBE, such as an ``ObjectTag`` or a ``CourseRun`` delete, triggers the
+  cleanup after it commits, as a best-effort step that is logged and leaves the empty group in place when it
+  fails.

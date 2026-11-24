@@ -764,8 +764,15 @@ def _validate_rule_source(
         raise ValidationError(errors) from exc
 
 
-def _set_history_user(instance: Any, user: UserType) -> None:
-    """Record ``user`` as the author of ``instance``'s next history row; API callers have no request middleware."""
+def _set_history_user(instance: Any, user: UserType | None) -> None:
+    """
+    Record ``user`` as the author of ``instance``'s next history row; API callers have no request middleware.
+
+    ``None`` leaves the author to ``simple_history``: the request user when a request is in progress, otherwise
+    nobody. A cascade from a content or course deletion passes ``None``.
+    """
+    if user is None:
+        return
     instance._history_user = user  # type: ignore[attr-defined]  # pylint: disable=protected-access
 
 
@@ -856,10 +863,12 @@ def bulk_update_competency_criteria(
         _validate_rule_source(rule_profile_id, rule_type_override, rule_payload_override)
 
         # Every CBE authoring writer of a competency's criteria takes its Tag row lock first and no other row lock
-        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag, a Taxonomy
-        # or a CourseRun take the Tag row last, and can deadlock with a create or a hard delete: one side fails
-        # with a MySQL 1213 error and no data is corrupted. Everything below reads committed state, since a
-        # delete, an archive or a create for this competency can't commit while this transaction holds the lock.
+        # before it, so those writers can't deadlock with each other. Django's cascade deletes of a Tag or a
+        # Taxonomy take the Tag row last, and can deadlock with a create or a hard delete: one side fails with a
+        # MySQL 1213 error and no data is corrupted. The cleanup that follows an ObjectTag or CourseRun delete
+        # (signal_handlers.py) runs after that delete commits and takes this lock first, like every writer, so it
+        # can't deadlock with them. Everything below reads committed state, since a delete, an archive or a create
+        # for this competency can't commit while this transaction holds the lock.
         # The reads above are safe without it because a group's tag, parent and course never change.
         Tag.objects.select_for_update().get(pk=group.tag_id)
 
@@ -1089,66 +1098,83 @@ def update_competency_criteria_group(
         return group
 
 
-def _archive_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
-    """Archive ``group``, writing only the flag and recording ``user`` in its history."""
+def _archive_group(group: CompetencyCriteriaGroup, user: UserType | None, using: str | None = None) -> None:
+    """Archive ``group``, writing only the flag and recording ``user`` in its history. ``using`` is a database alias."""
     group.archived = True
     _set_history_user(group, user)
-    group.save(update_fields=["archived"])
+    group.save(update_fields=["archived"], using=using)
 
 
-def _cascade_remove_from_group(group: CompetencyCriteriaGroup, user: UserType) -> None:
+def _parent_group(group: CompetencyCriteriaGroup, using: str | None = None) -> CompetencyCriteriaGroup | None:
+    """Return ``group``'s parent, read on ``using`` when it is given, because a lazy load goes through the router."""
+    if using is None or group.parent_id is None:
+        return group.parent
+    return CompetencyCriteriaGroup.objects.using(using).get(pk=group.parent_id)
+
+
+def _cascade_remove_from_group(
+    group: CompetencyCriteriaGroup, user: UserType | None, using: str | None = None
+) -> None:
     """
     Walk ``group`` and its ancestors, deleting or archiving any left with no live children.
 
     An archived group is never saved again: everything above it was handled when it was archived,
     so a second save would only add a redundant history row. If it has no criteria, no child groups
-    and no group-level status, it is deleted and the walk continues upward, so no empty group stays
-    persisted. Otherwise the walk stops there.
+    and no group-level status, it is deleted and the walk continues upward; otherwise the walk stops
+    there. So no empty group stays persisted when a walk completes, but a cleanup that a content deletion
+    triggers can fail, and then the empty group stays, logged (ADR 0002).
+
+    ``using`` is the alias of the database to read and write on, for a caller reacting to a write made there;
+    by default the router chooses.
     """
-    parent = group.parent
+    parent = _parent_group(group, using)
+    criteria = CompetencyCriterion.objects.using(using).filter(group_id=group.pk)
+    child_groups = CompetencyCriteriaGroup.objects.using(using).filter(parent_id=group.pk)
     if group.archived:
-        if group.criteria.exists() or group.child_groups.exists():
+        if criteria.exists() or child_groups.exists():
             return
-        if _group_has_learner_progress(group.id):
+        if _group_has_learner_progress(group.id, using):
             return
         _set_history_user(group, user)
-        group.delete()
+        group.delete(using=using)
         if parent is not None:
-            _cascade_remove_from_group(parent, user)
+            _cascade_remove_from_group(parent, user, using)
         return
-    has_live_child = (
-        group.criteria.filter(archived=False).exists() or group.child_groups.filter(archived=False).exists()
-    )
+    has_live_child = criteria.filter(archived=False).exists() or child_groups.filter(archived=False).exists()
     if has_live_child:
         return
-    if not group.criteria.exists() and not group.child_groups.exists():
-        if _group_has_learner_progress(group.id):
-            _archive_group(group, user)
+    if not criteria.exists() and not child_groups.exists():
+        if _group_has_learner_progress(group.id, using):
+            _archive_group(group, user, using)
         else:
             _set_history_user(group, user)
-            group.delete()
+            group.delete(using=using)
     else:
         # Only archived children remain.
-        _archive_group(group, user)
+        _archive_group(group, user, using)
     if parent is not None:
-        _cascade_remove_from_group(parent, user)
+        _cascade_remove_from_group(parent, user, using)
 
 
-def _write_criterion_archived(criterion: CompetencyCriterion, user: UserType) -> bool:
+def _write_criterion_archived(
+    criterion: CompetencyCriterion, user: UserType | None, using: str | None = None
+) -> bool:
     """
     Archive ``criterion`` in place, recording ``user`` in its history, without cascading to its group.
 
     Returns False and writes nothing if ``criterion`` is already archived, so a repeat call adds no history row.
+
+    ``using`` is a database alias to write on.
     """
     if criterion.archived:
         return False
     criterion.archived = True
     _set_history_user(criterion, user)
-    criterion.save(update_fields=["archived"])
+    criterion.save(update_fields=["archived"], using=using)
     return True
 
 
-def _archive_criterion(criterion: CompetencyCriterion, user: UserType) -> None:
+def _archive_criterion(criterion: CompetencyCriterion, user: UserType | None) -> None:
     """
     Archive ``criterion`` in place and cascade the archive to any ancestor left with no live children.
 
@@ -1163,9 +1189,9 @@ def _criterion_has_learner_progress(criterion_id: int) -> bool:
     return StudentCompetencyCriterionStatus.objects.filter(criterion_id=criterion_id).exists()
 
 
-def _group_has_learner_progress(group_id: int) -> bool:
-    """Return whether a learner group-level status row references ``group_id``."""
-    return StudentCompetencyCriteriaGroupStatus.objects.filter(group_id=group_id).exists()
+def _group_has_learner_progress(group_id: int, using: str | None = None) -> bool:
+    """Return whether a learner group-level status row references ``group_id``, reading on ``using``."""
+    return StudentCompetencyCriteriaGroupStatus.objects.using(using).filter(group_id=group_id).exists()
 
 
 def delete_or_archive_competency_criterion(criterion_id: int, user: UserType) -> CriterionDeletionResult:
@@ -1276,21 +1302,26 @@ def _resolve_competency_criteria_group_course(group: CompetencyCriteriaGroup) ->
     )
 
 
-def _competency_criteria_subtree(target: CompetencyCriteriaGroup) -> tuple[set[int], list[CompetencyCriterion]]:
+def _competency_criteria_subtree(
+    target: CompetencyCriteriaGroup, using: str | None = None
+) -> tuple[set[int], list[CompetencyCriterion]]:
     """
     Return the ids of ``target`` and its descendant groups (found level by level), and the subtree's criteria.
 
-    Must run inside a transaction that already holds the competency's Tag lock, so no tree change
-    for that competency can land between this read and the delete or archive that follows it.
+    When the result decides a delete or archive, this must run inside a transaction that already holds the
+    competency's Tag lock, so no tree change for that competency can land between this read and that write.
+    A caller that only enumerates rows, such as a ``pre_delete`` receiver inside the deleting transaction, needs
+    no lock, because the delete has already collected them.
+    ``using`` is a database alias to read on.
     """
     subtree_ids = {target.pk}
     level_ids = [target.pk]
     while level_ids:
         level_ids = list(
-            CompetencyCriteriaGroup.objects.filter(parent_id__in=level_ids).values_list("pk", flat=True)
+            CompetencyCriteriaGroup.objects.using(using).filter(parent_id__in=level_ids).values_list("pk", flat=True)
         )
         subtree_ids.update(level_ids)
-    criteria = list(CompetencyCriterion.objects.filter(group_id__in=subtree_ids).order_by("pk"))
+    criteria = list(CompetencyCriterion.objects.using(using).filter(group_id__in=subtree_ids).order_by("pk"))
     return subtree_ids, criteria
 
 
@@ -1298,21 +1329,26 @@ def _archive_competency_criteria_subtree(
     target_group: CompetencyCriteriaGroup,
     all_group_ids: set[int],
     criteria: list[CompetencyCriterion],
-    user: UserType,
+    user: UserType | None,
+    using: str | None = None,
 ) -> None:
     """
     Archive every group and criterion in the subtree, reconcile the subtree's associations, then cascade above it.
+
+    ``user`` is recorded in the history of every row written. With ``None``, ``simple_history`` picks the author:
+    the request user when a request is in progress, otherwise nobody.
+    ``using`` is a database alias to read and write on.
     """
     # The criteria are written without #674's per-criterion cascade: every group in the subtree is archived
     # here, and the one upward walk below covers the target's ancestors. The subtree's associations are
     # reconciled after the archive, so an assignment nothing measures stops showing the tag.
-    for group in CompetencyCriteriaGroup.objects.filter(id__in=all_group_ids, archived=False):
-        _archive_group(group, user)
+    for group in CompetencyCriteriaGroup.objects.using(using).filter(id__in=all_group_ids, archived=False):
+        _archive_group(group, user, using)
     for criterion in criteria:
-        _write_criterion_archived(criterion, user)
-    _reconcile_object_tags({criterion.object_tag_id for criterion in criteria})
+        _write_criterion_archived(criterion, user, using)
+    _reconcile_object_tags({criterion.object_tag_id for criterion in criteria}, using)
     if target_group.parent is not None:
-        _cascade_remove_from_group(target_group.parent, user)
+        _cascade_remove_from_group(target_group.parent, user, using)
 
 
 def _subtree_has_learner_progress(group_ids: set[int], criterion_ids: list[int]) -> bool:
@@ -1323,7 +1359,7 @@ def _subtree_has_learner_progress(group_ids: set[int], criterion_ids: list[int])
     )
 
 
-def _reconcile_object_tags(candidate_ids: set[int]) -> None:
+def _reconcile_object_tags(candidate_ids: set[int], using: str | None = None) -> None:
     """
     Settle each association (ObjectTag) in ``candidate_ids`` after criteria that used it were removed or archived.
 
@@ -1349,24 +1385,29 @@ def _reconcile_object_tags(candidate_ids: set[int]) -> None:
     delete locks the association row and then cascades into criterion rows. This call runs after its caller
     has written the criterion rows, and then locks the association rows. One side fails with a MySQL 1213
     error and no data is corrupted.
+
+    ``using`` is the alias of the database to read and write on, for a caller reacting to a write made there;
+    by default the router chooses.
     """
     if not candidate_ids:
         return
     active = set(
-        CompetencyCriterion.objects.filter(object_tag_id__in=candidate_ids, archived=False).values_list(
-            "object_tag_id", flat=True
-        )
+        CompetencyCriterion.objects.using(using)
+        .filter(object_tag_id__in=candidate_ids, archived=False)
+        .values_list("object_tag_id", flat=True)
     )
     to_remove = candidate_ids - active
     # Read from CompetencyCriterion, whose foreign key guarantees these ObjectTag rows exist, which
     # lock_object_tags_for_deletion() needs because it raises on an unknown id. The delete below ignores a
     # missing id.
     referenced = set(
-        CompetencyCriterion.objects.filter(object_tag_id__in=to_remove).values_list("object_tag_id", flat=True)
+        CompetencyCriterion.objects.using(using)
+        .filter(object_tag_id__in=to_remove)
+        .values_list("object_tag_id", flat=True)
     )
     if referenced:
-        lock_object_tags_for_deletion(referenced)
-    ObjectTag.objects.filter(pk__in=to_remove).delete()
+        lock_object_tags_for_deletion(referenced, using=using)
+    ObjectTag.objects.using(using).filter(pk__in=to_remove).delete()
 
 
 def delete_or_archive_competency_criteria_group(group_id: int, user: UserType) -> GroupDeletionResult:
