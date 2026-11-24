@@ -6,6 +6,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+from opaque_keys.edx.keys import CourseKey
+
+from .models import MasteryStatus
+
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class GradedObjectScore:
@@ -154,3 +158,60 @@ class LearnerCourseCriteria:
     competencies: list[LearnerCompetency]
     groups: list[LearnerCriteriaGroup]
     criteria: list[LearnerCriterion]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LearnerCourseRun:
+    """
+    A course run, as named in a learner's status: its key and its title.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    course_key: CourseKey
+    title: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LearnerCompetencyStatus:
+    """
+    A learner's status for one competency, or for an ancestor of a competency, of a course run.
+
+    ``tag_id`` is the Tag id. ``demonstrated_in_course`` is None unless ``status`` is
+    :attr:`MasteryStatus.DEMONSTRATED`. It then names the other course run whose course-level group for this tag
+    was first recorded as Demonstrated, and is None when no other run has one, or when the requested course run's own
+    course-level group is Demonstrated too. A staff correction under ADR 0004 can rewrite a group status, and so
+    change which course run is named.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    tag_id: int
+    status: MasteryStatus
+    demonstrated_in_course: LearnerCourseRun | None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LearnerCriterionStatus:
+    """
+    A learner's status for one criterion of a course run.
+
+    ``criterion_id`` is the CompetencyCriterion id.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    criterion_id: int
+    status: MasteryStatus
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LearnerCompetencyStatuses:
+    """
+    One learner's stored statuses for the competencies and criteria of a course run, each list ordered by id.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    competency_statuses: list[LearnerCompetencyStatus]
+    criterion_statuses: list[LearnerCriterionStatus]

@@ -13,4 +13,9 @@ urlpatterns = [
         learner_views.LearnerCourseCriteriaView.as_view(),
         name="course-criteria",
     ),
+    re_path(
+        r"^courses/(?P<course_key>[\s\S]+)/competency-statuses/$",
+        learner_views.LearnerCompetencyStatusesView.as_view(),
+        name="course-competency-statuses",
+    ),
 ]

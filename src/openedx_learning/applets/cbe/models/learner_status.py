@@ -37,6 +37,9 @@ class MasteryStatus(models.IntegerChoices):
     directly to decide whether a write raises a status, so their order is a contract. They are
     spaced by 10 so that a new rank can go between two existing ones without renumbering
     stored rows.
+
+    The labels are API values, sent to clients as the ``status`` of a learner's statuses, and must stay
+    untranslated.
     """
 
     ATTEMPTED_NOT_DEMONSTRATED = 10, "AttemptedNotDemonstrated"

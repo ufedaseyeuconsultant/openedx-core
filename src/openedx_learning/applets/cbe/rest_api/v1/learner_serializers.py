@@ -90,3 +90,48 @@ class LearnerCourseCriteriaSerializer(_ReadOnlySerializer):
     competencies = LearnerCompetencySerializer(many=True, read_only=True)
     groups = LearnerCriteriaGroupSerializer(many=True, read_only=True)
     criteria = LearnerCriterionSerializer(many=True, read_only=True)
+
+
+class LearnerCourseRunSerializer(_ReadOnlySerializer):
+    """
+    Read-only representation of a ``LearnerCourseRun``: a course run named by its key and title.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    course_key = serializers.CharField(read_only=True)
+    title = serializers.CharField(read_only=True)
+
+
+class LearnerCompetencyStatusSerializer(_ReadOnlySerializer):
+    """
+    Read-only representation of a ``LearnerCompetencyStatus``, with ``status`` rendered as its label.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    tag_id = serializers.IntegerField(read_only=True)
+    status = serializers.CharField(source="status.label", read_only=True)
+    demonstrated_in_course = LearnerCourseRunSerializer(read_only=True)
+
+
+class LearnerCriterionStatusSerializer(_ReadOnlySerializer):
+    """
+    Read-only representation of a ``LearnerCriterionStatus``, with ``status`` rendered as its label.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    criterion_id = serializers.IntegerField(read_only=True)
+    status = serializers.CharField(source="status.label", read_only=True)
+
+
+class LearnerCompetencyStatusesSerializer(_ReadOnlySerializer):
+    """
+    Read-only representation of a ``LearnerCompetencyStatuses``: its two lists, each rendered by its own serializer.
+
+    UNSTABLE: see :func:`openedx_learning.applets.cbe.api.get_learner_competency_statuses`.
+    """
+
+    competency_statuses = LearnerCompetencyStatusSerializer(many=True, read_only=True)
+    criterion_statuses = LearnerCriterionStatusSerializer(many=True, read_only=True)

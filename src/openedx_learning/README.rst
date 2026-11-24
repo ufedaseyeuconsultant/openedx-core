@@ -49,3 +49,10 @@ usage keys of every subsection with criteria, including hidden and unreleased on
         path("api/", include("openedx_learning.urls")),
         path("api/", include("openedx_learning.learner_urls")),
     ]
+
+The learner routes that name a learner with a ``learner_id`` query parameter ask a resolver whose
+dotted path is the top-level setting ``OPENEDX_LEARNING_LEARNER_RESOLVER``. The built-in default
+admits only the requester: a request with no ``learner_id``, or with the requester's own id, reads
+the requester's data, and any other id answers 404. A host that lets course staff read another
+learner's data, or supports masquerading, sets the setting to its own callable. The callable's contract is in
+`ADR 0008 <../../docs/openedx_learning/decisions/0008-learner-resolver.rst>`__.

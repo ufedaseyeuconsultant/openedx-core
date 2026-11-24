@@ -3,9 +3,11 @@ Views for the CBE REST API, v1, for learners.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from typing import Any, cast
 
+from django.http import Http404
 from django.utils.translation import gettext_lazy as _
 from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthentication  # type: ignore[import]
 from edx_rest_framework_extensions.auth.session.authentication import (  # type: ignore[import]
@@ -13,15 +15,17 @@ from edx_rest_framework_extensions.auth.session.authentication import (  # type:
 )
 from opaque_keys import InvalidKeyError
 from rest_framework import generics
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from ...api import get_course_competency_criteria
+from ...api import get_course_competency_criteria, get_learner_competency_statuses
 from ...data import LearnerCompetency, LearnerCourseCriteria
+from ..learner_resolver import resolve_learner
 from ..paginators import LearnerCourseCriteriaPagination
-from .learner_serializers import LearnerCourseCriteriaSerializer
+from .learner_serializers import LearnerCompetencyStatusesSerializer, LearnerCourseCriteriaSerializer
 from .serializers import parse_plain_course_key
 
 
@@ -126,3 +130,70 @@ class LearnerCourseCriteriaView(generics.GenericAPIView):
             "next": paginator.get_next_link(),
             "previous": paginator.get_previous_link(),
         })
+
+
+# 18 digits always fit a signed 64-bit id, and Django answers an out-of-range exact lookup with no rows,
+# so an accepted value can never make a host's lookup error.
+_LEARNER_ID = re.compile(r"[1-9][0-9]{0,17}")
+
+
+class LearnerCompetencyStatusesView(APIView):
+    """
+    GET-only. Return one learner's competency and criterion statuses for a course run, for the Progress tab.
+
+    ``GET api/cbe/v1/courses/<course_key>/competency-statuses/``
+
+    UNSTABLE, and what each list holds: see ``get_learner_competency_statuses``.
+
+    The optional query parameter ``learner_id`` names the learner, as a positive integer user id of at most 18
+    ASCII digits, without a sign, spaces, underscores or leading zeros. The learner resolver decides whose
+    statuses a request may read (see
+    :func:`openedx_learning.applets.cbe.rest_api.learner_resolver.default_learner_resolver`).
+
+    Checks run in this order: sign-in (401), course key (400), ``learner_id`` is a valid id (404), resolver
+    (404 or 403). A ``learner_id`` that is not valid, including an empty value, and any 404 from the resolver all
+    give the same bare 404.
+
+    The response is not paginated and carries nothing that identifies the learner.
+
+    **Example Response**
+
+    .. code-block:: json
+
+        {
+            "competency_statuses": [
+                {"tag_id": 12, "status": "Demonstrated",
+                 "demonstrated_in_course": {"course_key": "course-v1:Org1+Python200+Fall2026", "title": "Python 200"}},
+                {"tag_id": 13, "status": "PartiallyAttempted", "demonstrated_in_course": null}
+            ],
+            "criterion_statuses": [
+                {"criterion_id": 7, "status": "Demonstrated"}
+            ]
+        }
+    """
+
+    authentication_classes = (JwtAuthentication, SessionAuthenticationAllowInactiveUser)
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get"]
+
+    def get(self, request, course_key):
+        """Return the statuses of the learner the resolver chooses, after the key and ``learner_id`` are checked."""
+        try:
+            plain_course_key = parse_plain_course_key(course_key)
+        except InvalidKeyError as exc:
+            raise DRFValidationError(
+                {"course_key": [_("'%(value)s' is not a valid course run key.") % {"value": course_key}]}
+            ) from exc
+        raw_learner_id = request.query_params.get("learner_id")
+        if raw_learner_id is not None and not _LEARNER_ID.fullmatch(raw_learner_id):
+            raise Http404
+        learner_id = None if raw_learner_id is None else int(raw_learner_id)
+
+        try:
+            learner = resolve_learner(request, plain_course_key, learner_id)
+        except (Http404, NotFound):
+            # Re-raised bare so that a message from a host resolver cannot tell "not visible" from "no such user".
+            raise Http404 from None
+
+        result = get_learner_competency_statuses(user_id=learner.pk, course_key=plain_course_key)
+        return Response(LearnerCompetencyStatusesSerializer(result).data)

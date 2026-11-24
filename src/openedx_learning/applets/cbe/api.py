@@ -31,9 +31,13 @@ from .data import (
     GradedObjectScore,
     GroupDeletionResult,
     LearnerCompetency,
+    LearnerCompetencyStatus,
+    LearnerCompetencyStatuses,
     LearnerCourseCriteria,
+    LearnerCourseRun,
     LearnerCriteriaGroup,
     LearnerCriterion,
+    LearnerCriterionStatus,
     LearnerTaxonomy,
 )
 from .models import (
@@ -46,6 +50,7 @@ from .models import (
     MasteryStatus,
     StudentCompetencyCriteriaGroupStatus,
     StudentCompetencyCriterionStatus,
+    StudentCompetencyStatus,
 )
 from .rollup import roll_up_competency_statuses
 from .rule_payloads import evaluate_rule
@@ -60,9 +65,13 @@ __all__ = [
     "GradedObjectScore",
     "GroupDeletionResult",
     "LearnerCompetency",
+    "LearnerCompetencyStatus",
+    "LearnerCompetencyStatuses",
     "LearnerCourseCriteria",
+    "LearnerCourseRun",
     "LearnerCriteriaGroup",
     "LearnerCriterion",
+    "LearnerCriterionStatus",
     "LearnerTaxonomy",
     "associate_competency_criterion",
     "bulk_update_competency_criteria",
@@ -75,6 +84,7 @@ __all__ = [
     "get_competency_rule_profiles",
     "get_course_competency_criteria",
     "get_courses_with_live_criteria",
+    "get_learner_competency_statuses",
     "is_competency_taxonomy",
     "record_graded_object_statuses",
     "resolve_competency_tag",
@@ -315,6 +325,15 @@ def _has_archived_ancestor_tag() -> Q:
     return archived_ancestor
 
 
+def _is_course_level_group(prefix: str = "") -> Q:
+    """
+    Return a filter that matches a course-level group: the child of a root group, whatever its course run.
+
+    ``prefix`` is the lookup path from the queried model to the group, such as ``"group__"``.
+    """
+    return Q(**{prefix + "parent__isnull": False, prefix + "parent__parent__isnull": True})
+
+
 def _get_live_course_level_groups(course_key: CourseKey) -> list[CompetencyCriteriaGroup]:
     """
     Return the live course-level groups of ``course_key``, each with its root group, tag and taxonomy loaded.
@@ -324,9 +343,8 @@ def _get_live_course_level_groups(course_key: CourseKey) -> list[CompetencyCrite
     """
     return list(
         CompetencyCriteriaGroup.objects.filter(
+            _is_course_level_group(),
             course__course_key=course_key,
-            parent__isnull=False,
-            parent__parent__isnull=True,
             archived=False,
             parent__archived=False,
             tag__archived=False,
@@ -539,6 +557,112 @@ def get_course_competency_criteria(course_key: CourseKey) -> LearnerCourseCriter
             for group, competency_id in groups
         ],
         criteria=learner_criteria,
+    )
+
+
+def _competency_and_ancestor_tag_ids(competency_ids: list[int]) -> set[int]:
+    """
+    Return ``competency_ids`` and the ids of all their ancestor tags, read through the ``parent`` chain.
+
+    The chain is what the roll-up walks when it writes an ancestor's status. A tag has at most
+    ``TAXONOMY_MAX_DEPTH`` ancestors, so the whole chain is read in one query with a fixed number of joins.
+    """
+    ancestor_paths = ["parent" + "__parent" * level for level in range(TAXONOMY_MAX_DEPTH)]
+    tag_ids = set(competency_ids)
+    for chain in Tag.objects.filter(pk__in=competency_ids).values_list(*ancestor_paths):
+        tag_ids.update(tag_id for tag_id in chain if tag_id is not None)
+    return tag_ids
+
+
+def _first_demonstrated_in_other_courses(
+    user_id: int, course_key: CourseKey, tag_ids: list[int],
+) -> dict[int, LearnerCourseRun]:
+    """
+    Return, for each tag in ``tag_ids`` that has one, the other course run whose course-level group was first
+    recorded as Demonstrated for the learner.
+
+    The earliest ``modified`` of a Demonstrated course-level group status wins, and the row id breaks a tie.
+    ``modified`` is when the status was written, which a staff correction under ADR 0004 can change. A tag whose
+    course-level group in ``course_key`` is itself Demonstrated has no entry.
+    """
+    rows = (
+        StudentCompetencyCriteriaGroupStatus.objects.filter(
+            _is_course_level_group("group__"),
+            user_id=user_id,
+            status_id=MasteryStatus.DEMONSTRATED,
+            group__tag_id__in=tag_ids,
+            group__course__isnull=False,
+        )
+        .order_by("modified", "id")
+        .values_list("group__tag_id", "group__course__course_key", "group__course__title")
+    )
+    first_by_tag: dict[int, LearnerCourseRun] = {}
+    demonstrated_here: set[int] = set()
+    for tag_id, row_course_key, title in rows:
+        if row_course_key == course_key:
+            demonstrated_here.add(tag_id)
+        else:
+            first_by_tag.setdefault(tag_id, LearnerCourseRun(course_key=cast(CourseKey, row_course_key), title=title))
+    return {tag_id: run for tag_id, run in first_by_tag.items() if tag_id not in demonstrated_here}
+
+
+def get_learner_competency_statuses(*, user_id: int, course_key: CourseKey) -> LearnerCompetencyStatuses:
+    """
+    Return one learner's stored competency and criterion statuses for the live criteria of a course run.
+
+    UNSTABLE: the learner frontends that show these statuses
+    (https://github.com/openedx/openedx-core/issues/739 and https://github.com/openedx/openedx-core/issues/740)
+    are still to come, so what this function returns may change without a deprecation cycle.
+
+    This function checks no permission; the caller decides whose statuses may be read.
+
+    :param user_id: The learner.
+    :param course_key: The course run, as a plain course key with its branch and version stripped.
+    :return: A :class:`LearnerCompetencyStatuses` with two lists, each ordered by id and each holding only the
+        rows the learner has: ``criterion_statuses`` for the criteria
+        :func:`get_course_competency_criteria` returns, and ``competency_statuses`` for the competencies
+        it returns and for every ancestor of those competencies. An archived record hides a status here exactly
+        when it hides the record there. A key with no course run, or a course run with no criteria, gives two
+        empty lists. A competency status is the learner's overall status for the tag, so it can come from work in
+        another course run. For ``demonstrated_in_course``, see :class:`LearnerCompetencyStatus`; the other course
+        run is named whether or not its records are archived.
+    """
+    course_criteria = get_course_competency_criteria(course_key)
+
+    # With no criteria, every list below is empty and Django sends no query for an empty ``IN`` list.
+    tag_ids = _competency_and_ancestor_tag_ids([competency.id for competency in course_criteria.competencies])
+    competency_rows = list(
+        StudentCompetencyStatus.objects.filter(user_id=user_id, tag_id__in=tag_ids)
+        .order_by("tag_id")
+        .values_list("tag_id", "status_id")
+    )
+    criterion_rows = list(
+        StudentCompetencyCriterionStatus.objects.filter(
+            user_id=user_id, criterion_id__in=[criterion.id for criterion in course_criteria.criteria],
+        )
+        .order_by("criterion_id")
+        .values_list("criterion_id", "status_id")
+    )
+
+    demonstrated_in_course = _first_demonstrated_in_other_courses(
+        user_id,
+        course_key,
+        [tag_id for tag_id, status_id in competency_rows if status_id == MasteryStatus.DEMONSTRATED],
+    )
+
+    return LearnerCompetencyStatuses(
+        competency_statuses=[
+            LearnerCompetencyStatus(
+                tag_id=tag_id,
+                status=MasteryStatus(status_id),
+                demonstrated_in_course=demonstrated_in_course.get(tag_id),
+            )
+            for tag_id, status_id in competency_rows
+        ],
+        criterion_statuses=[
+            LearnerCriterionStatus(criterion_id=criterion_id, status=MasteryStatus(status_id))
+            for criterion_id, status_id in criterion_rows
+        ],
     )
 
 
